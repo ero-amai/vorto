@@ -194,6 +194,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -201,9 +202,9 @@ jobs:
           release_title="vorto ${{ needs.prepare.outputs.release_version }}"
           notes_file="release-notes/release-notes.md"
 
-          if gh release view "${tag_name}" >/dev/null 2>&1; then
-            gh release edit "${tag_name}" --title "${release_title}" --notes-file "${notes_file}"
-            gh release upload "${tag_name}" artifacts/* --clobber
+          if gh release view "${tag_name}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release edit "${tag_name}" --repo "${GH_REPO}" --title "${release_title}" --notes-file "${notes_file}"
+            gh release upload "${tag_name}" artifacts/* --repo "${GH_REPO}" --clobber
           else
-            gh release create "${tag_name}" artifacts/* --title "${release_title}" --notes-file "${notes_file}"
+            gh release create "${tag_name}" artifacts/* --repo "${GH_REPO}" --title "${release_title}" --notes-file "${notes_file}"
           fi
