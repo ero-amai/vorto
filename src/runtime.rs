@@ -557,54 +557,59 @@ async fn run_udp_tunnel(
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     cleanup_tick.tick().await;
 
-    loop {
-        tokio::select! {
-            readiness = listener.readable() => {
-                readiness?;
+    let result: AppResult<()> = async {
+        loop {
+            tokio::select! {
+                readiness = listener.readable() => {
+                    readiness?;
 
-                #[cfg(target_os = "linux")]
-                forward_udp_listener_batch(
-                    &listener,
-                    spec.target.as_str(),
-                    &mut sessions,
-                    &stop_rx,
-                    &mut batch,
-                )
-                .await?;
+                    #[cfg(target_os = "linux")]
+                    forward_udp_listener_batch(
+                        &listener,
+                        spec.target.as_str(),
+                        &mut sessions,
+                        &stop_rx,
+                        &mut batch,
+                    )
+                    .await?;
 
-                #[cfg(not(target_os = "linux"))]
-                {
-                    for _ in 0..UDP_DRAIN_BURST {
-                        let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
-                            Ok(result) => result,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(error) => return Err(error.into()),
-                        };
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        for _ in 0..UDP_DRAIN_BURST {
+                            let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
+                                Ok(result) => result,
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(error) => return Err(error.into()),
+                            };
 
-                        if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-                            let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
-                            entry.insert(session);
-                        }
+                            if let Entry::Vacant(entry) = sessions.entry(client_addr) {
+                                let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
+                                entry.insert(session);
+                            }
 
-                        if let Some(session) = sessions.get_mut(&client_addr) {
-                            session.last_seen = Instant::now();
-                            send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                            if let Some(session) = sessions.get_mut(&client_addr) {
+                                session.last_seen = Instant::now();
+                                send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                            }
                         }
                     }
                 }
-            }
-            _ = cleanup_tick.tick() => {
-                retire_stale_udp_sessions(&mut sessions);
-            }
-            _ = wait_for_shutdown(&mut stop_rx) => {
-                break;
+                _ = cleanup_tick.tick() => {
+                    retire_stale_udp_sessions(&mut sessions);
+                }
+                _ = wait_for_shutdown(&mut stop_rx) => {
+                    break;
+                }
             }
         }
+
+        Ok(())
     }
+    .await;
 
     shutdown_udp_sessions(sessions).await;
 
-    Ok(())
+    result
 }
 
 #[cfg(target_os = "linux")]
