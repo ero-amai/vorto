@@ -68,13 +68,9 @@ jobs:
           mkdir -p dist
 
           {
-            echo "# vorto ${{ steps.meta.outputs.release_version }}"
-            echo
-            echo "- Repository: https://github.com/ero-amai/vorto"
             echo "- Version: ${{ steps.meta.outputs.release_version }}"
             echo "- Commit: ${{ steps.meta.outputs.git_sha }}"
             echo "- Commit range: ${{ steps.meta.outputs.commit_range }}"
-            echo "- Source: https://github.com/ero-amai/vorto"
             echo
             echo "## Included commits"
             git log "${{ steps.meta.outputs.log_range }}" --reverse --pretty=format:'- `%h` %s'
