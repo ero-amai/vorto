@@ -129,7 +129,9 @@ tunnels:
 
 - `auto`: Current default. At the moment it resolves to `throughput`.
 - `throughput`: Optimized for large bulk TCP transfers. On Linux this uses the `splice` path.
-- `latency`: Better suited for interactive traffic and many small TCP packets. This mode enables `TCP_NODELAY` and uses a regular copy-based relay path.
+- `latency`: Better suited for interactive traffic and many small TCP packets. This mode uses a regular copy-based relay path and applies extra low-latency socket tuning on Linux.
+
+`TCP_NODELAY` is enabled for all TCP tunnels to avoid startup latency from Nagle buffering.
 
 For UDP-only tunnels, `tcp_mode` is ignored.
 

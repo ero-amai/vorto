@@ -1,6 +1,8 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::io;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::Once;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +37,8 @@ const UDP_RECV_BATCH_SIZE: usize = 32;
 const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
 #[cfg(target_os = "linux")]
 const SPLICE_PIPE_SIZE: libc::c_int = 1_048_576;
+#[cfg(target_os = "linux")]
+static PIPE_SIZE_WARNING: Once = Once::new();
 
 #[derive(Default)]
 pub struct TunnelManager {
@@ -283,9 +287,8 @@ fn configure_tcp_streams(
     outbound: &TcpStream,
     tcp_mode: TcpMode,
 ) -> io::Result<()> {
-    let nodelay = matches!(tcp_mode.effective(), TcpMode::Latency);
-    inbound.set_nodelay(nodelay)?;
-    outbound.set_nodelay(nodelay)?;
+    inbound.set_nodelay(true)?;
+    outbound.set_nodelay(true)?;
     #[cfg(unix)]
     {
         tune_socket_buffers(
@@ -300,7 +303,7 @@ fn configure_tcp_streams(
         )?;
     }
     #[cfg(target_os = "linux")]
-    if nodelay {
+    if matches!(tcp_mode.effective(), TcpMode::Latency) {
         set_socket_option(
             inbound.as_raw_fd(),
             libc::IPPROTO_TCP,
@@ -398,7 +401,8 @@ async fn splice_one_way(source: Arc<TcpStream>, destination: Arc<TcpStream>) -> 
             )
         }) {
             Ok(copied) => copied,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
         };
 
         if copied == 0 {
@@ -417,7 +421,8 @@ async fn splice_one_way(source: Arc<TcpStream>, destination: Arc<TcpStream>) -> 
                 )
             }) {
                 Ok(moved) => moved,
-                Err(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
             };
 
             if moved == 0 {
@@ -490,10 +495,52 @@ impl SplicePipe {
 
         let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let _ = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, SPLICE_PIPE_SIZE) };
+        tune_splice_pipe_size(write.as_raw_fd());
 
         Ok(Self { read, write })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_splice_pipe_size(fd: RawFd) {
+    let requested = SPLICE_PIPE_SIZE;
+    let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, requested) };
+    if result >= 0 {
+        let actual = result as libc::c_int;
+        if actual < requested {
+            warn_pipe_size_degraded(Some(actual), None);
+        }
+        return;
+    }
+
+    let error = io::Error::last_os_error();
+    let actual = pipe_size(fd);
+    warn_pipe_size_degraded(actual, Some(error));
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_size(fd: RawFd) -> Option<libc::c_int> {
+    let result = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+    (result >= 0).then_some(result as libc::c_int)
+}
+
+#[cfg(target_os = "linux")]
+fn warn_pipe_size_degraded(actual: Option<libc::c_int>, error: Option<io::Error>) {
+    PIPE_SIZE_WARNING.call_once(|| match (actual, error) {
+        (Some(actual), Some(error)) => eprintln!(
+            "Warning: failed to raise splice pipe size to {} bytes (current: {} bytes): {}",
+            SPLICE_PIPE_SIZE, actual, error
+        ),
+        (None, Some(error)) => eprintln!(
+            "Warning: failed to raise splice pipe size to {} bytes: {}",
+            SPLICE_PIPE_SIZE, error
+        ),
+        (Some(actual), None) => eprintln!(
+            "Warning: splice pipe size is {} bytes, below requested {} bytes.",
+            actual, SPLICE_PIPE_SIZE
+        ),
+        (None, None) => {}
+    });
 }
 
 async fn run_udp_tunnel(
@@ -510,54 +557,59 @@ async fn run_udp_tunnel(
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     cleanup_tick.tick().await;
 
-    loop {
-        tokio::select! {
-            readiness = listener.readable() => {
-                readiness?;
+    let result: AppResult<()> = async {
+        loop {
+            tokio::select! {
+                readiness = listener.readable() => {
+                    readiness?;
 
-                #[cfg(target_os = "linux")]
-                forward_udp_listener_batch(
-                    &listener,
-                    spec.target.as_str(),
-                    &mut sessions,
-                    &stop_rx,
-                    &mut batch,
-                )
-                .await?;
+                    #[cfg(target_os = "linux")]
+                    forward_udp_listener_batch(
+                        &listener,
+                        spec.target.as_str(),
+                        &mut sessions,
+                        &stop_rx,
+                        &mut batch,
+                    )
+                    .await?;
 
-                #[cfg(not(target_os = "linux"))]
-                {
-                    for _ in 0..UDP_DRAIN_BURST {
-                        let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
-                            Ok(result) => result,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(error) => return Err(error.into()),
-                        };
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        for _ in 0..UDP_DRAIN_BURST {
+                            let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
+                                Ok(result) => result,
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(error) => return Err(error.into()),
+                            };
 
-                        if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-                            let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
-                            entry.insert(session);
-                        }
+                            if let Entry::Vacant(entry) = sessions.entry(client_addr) {
+                                let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
+                                entry.insert(session);
+                            }
 
-                        if let Some(session) = sessions.get_mut(&client_addr) {
-                            session.last_seen = Instant::now();
-                            send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                            if let Some(session) = sessions.get_mut(&client_addr) {
+                                session.last_seen = Instant::now();
+                                send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                            }
                         }
                     }
                 }
-            }
-            _ = cleanup_tick.tick() => {
-                retire_stale_udp_sessions(&mut sessions);
-            }
-            _ = wait_for_shutdown(&mut stop_rx) => {
-                break;
+                _ = cleanup_tick.tick() => {
+                    retire_stale_udp_sessions(&mut sessions);
+                }
+                _ = wait_for_shutdown(&mut stop_rx) => {
+                    break;
+                }
             }
         }
+
+        Ok(())
     }
+    .await;
 
     shutdown_udp_sessions(sessions).await;
 
-    Ok(())
+    result
 }
 
 #[cfg(target_os = "linux")]
