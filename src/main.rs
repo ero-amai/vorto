@@ -168,24 +168,36 @@ fn read_pid(path: &Path) -> AppResult<Option<ProcessId>> {
     Ok(Some(pid))
 }
 
+#[cfg(target_os = "linux")]
 fn daemon_process_matches(pid: ProcessId) -> AppResult<bool> {
-    #[cfg(unix)]
-    {
-        let proc_dir = PathBuf::from(format!("/proc/{}", pid));
-        if !proc_dir.exists() {
-            return Ok(false);
-        }
-
-        let cmdline = fs::read(proc_dir.join("cmdline"))?;
-        let binary_name = current_binary_name()?;
-        Ok(is_daemon_worker_cmdline(&cmdline, &binary_name))
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{}", pid));
+    if !proc_dir.exists() {
+        return Ok(false);
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Ok(false)
+    let cmdline = fs::read(proc_dir.join("cmdline"))?;
+    let binary_name = current_binary_name()?;
+    Ok(is_daemon_worker_cmdline(&cmdline, &binary_name))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn daemon_process_matches(pid: ProcessId) -> AppResult<bool> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
     }
+
+    let command_line = String::from_utf8_lossy(&output.stdout);
+    let binary_name = current_binary_name()?;
+    Ok(is_daemon_worker_command(command_line.trim(), &binary_name))
+}
+
+#[cfg(not(unix))]
+fn daemon_process_matches(pid: ProcessId) -> AppResult<bool> {
+    let _ = pid;
+    Ok(false)
 }
 
 fn terminate_process(pid: ProcessId) -> AppResult<()> {
@@ -275,10 +287,29 @@ fn daemon_program_name(program: &[u8], binary_name: &str) -> bool {
         == Some(binary_name)
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_daemon_worker_command(command: &str, binary_name: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    let Some(worker_arg) = parts.next() else {
+        return false;
+    };
+
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some(binary_name)
+        && worker_arg == DAEMON_WORKER
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::{is_daemon_worker_cmdline, platform_pid};
+    #[cfg(all(unix, not(target_os = "linux")))]
+    use super::is_daemon_worker_command;
     use super::parse_pid;
 
     #[cfg(unix)]
@@ -314,5 +345,13 @@ mod tests {
     fn platform_pid_rejects_values_outside_pid_t_range() {
         let error = platform_pid(u32::MAX).expect_err("oversized pid should fail");
         assert!(error.to_string().contains("too large"));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn daemon_worker_command_matches_expected_process() {
+        assert!(is_daemon_worker_command("/tmp/vorto __daemon_worker", "vorto"));
+        assert!(!is_daemon_worker_command("/usr/bin/python3 server.py", "vorto"));
+        assert!(!is_daemon_worker_command("/tmp/vorto run", "vorto"));
     }
 }
