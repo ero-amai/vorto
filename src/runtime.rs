@@ -12,7 +12,7 @@ use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 #[cfg(target_os = "linux")]
 use std::net::Shutdown;
@@ -26,6 +26,8 @@ use crate::config::{AppConfig, TcpMode, TunnelConfig};
 
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
+const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
 const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
@@ -124,10 +126,11 @@ impl ActiveTunnel {
         if spec.protocol.supports_tcp() {
             let tcp_listener = TcpListener::bind(&spec.listen).await?;
             let tcp_spec = spec.clone();
+            let tcp_name = tcp_spec.name.clone();
             let tcp_stop = stop_rx.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(error) = run_tcp_tunnel(tcp_spec, tcp_listener, tcp_stop).await {
-                    eprintln!("TCP tunnel stopped: {}", error);
+                    eprintln!("TCP tunnel '{}' stopped: {}", tcp_name, error);
                 }
             }));
         }
@@ -136,10 +139,11 @@ impl ActiveTunnel {
             let udp_socket = Arc::new(UdpSocket::bind(&spec.listen).await?);
             configure_udp_socket(udp_socket.as_ref())?;
             let udp_spec = spec.clone();
+            let udp_name = udp_spec.name.clone();
             let udp_stop = stop_rx.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(error) = run_udp_tunnel(udp_spec, udp_socket, udp_stop).await {
-                    eprintln!("UDP tunnel stopped: {}", error);
+                    eprintln!("UDP tunnel '{}' stopped: {}", udp_name, error);
                 }
             }));
         }
@@ -154,7 +158,7 @@ impl ActiveTunnel {
     async fn stop(self) {
         let _ = self.stop_tx.send(true);
         for handle in self.handles {
-            let _ = handle.await;
+            wait_for_task_shutdown(handle, "tunnel worker").await;
         }
     }
 }
@@ -217,17 +221,28 @@ async fn run_tcp_tunnel(
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let mut connections = JoinSet::new();
+    let tunnel_name = spec.name.clone();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (inbound, _) = result?;
+                let (inbound, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                        log_tunnel_worker_error("TCP", &tunnel_name, "accept", &error);
+                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
                 let target = spec.target.clone();
                 let tcp_mode = spec.tcp_mode;
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
-                        eprintln!("TCP connection handling failed: {}", error);
+                        log_tcp_connection_error(error.as_ref());
                     }
                 });
             }
@@ -242,13 +257,64 @@ async fn run_tcp_tunnel(
         }
     }
 
-    while let Some(result) = connections.join_next().await {
-        if let Err(error) = result {
-            eprintln!("TCP connection task failed during shutdown: {}", error);
-        }
-    }
+    drain_tcp_connections(&mut connections).await;
 
     Ok(())
+}
+
+async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
+    while !connections.is_empty() {
+        match timeout(SHUTDOWN_GRACE_PERIOD, connections.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => {
+                if !error.is_cancelled() {
+                    eprintln!("TCP connection task failed during shutdown: {}", error);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!(
+                    "Warning: TCP connection tasks did not stop within {:?}; aborting them.",
+                    SHUTDOWN_GRACE_PERIOD
+                );
+                connections.abort_all();
+                while let Some(result) = connections.join_next().await {
+                    if let Err(error) = result && !error.is_cancelled() {
+                        eprintln!("TCP connection task failed after abort: {}", error);
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn log_tcp_connection_error(error: &dyn std::error::Error) {
+    if is_expected_tcp_disconnect_message(&error.to_string()) {
+        return;
+    }
+
+    eprintln!("TCP connection handling failed: {}", error);
+}
+
+fn log_tunnel_worker_error(
+    protocol: &str,
+    tunnel_name: &str,
+    stage: &str,
+    error: &dyn std::error::Error,
+) {
+    eprintln!(
+        "{} tunnel '{}' {} failed: {}",
+        protocol, tunnel_name, stage, error
+    );
+}
+
+fn is_expected_tcp_disconnect_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("broken pipe")
+        || message.contains("connection reset")
+        || message.contains("connection aborted")
+        || message.contains("unexpected eof")
 }
 
 async fn handle_tcp_connection(
@@ -549,6 +615,7 @@ async fn run_udp_tunnel(
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let mut sessions = HashMap::<std::net::SocketAddr, UdpSession>::new();
+    let tunnel_name = spec.name.clone();
     #[cfg(target_os = "linux")]
     let mut batch = UdpRecvBatch::new(UDP_RECV_BATCH_SIZE);
     #[cfg(not(target_os = "linux"))]
@@ -561,17 +628,32 @@ async fn run_udp_tunnel(
         loop {
             tokio::select! {
                 readiness = listener.readable() => {
-                    readiness?;
+                    if let Err(error) = readiness {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                        log_tunnel_worker_error("UDP", &tunnel_name, "listener readable", &error);
+                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
+                        continue;
+                    }
 
                     #[cfg(target_os = "linux")]
-                    forward_udp_listener_batch(
+                    if let Err(error) = forward_udp_listener_batch(
                         &listener,
                         spec.target.as_str(),
                         &mut sessions,
                         &stop_rx,
                         &mut batch,
                     )
-                    .await?;
+                    .await
+                    {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                        log_tunnel_worker_error("UDP", &tunnel_name, "batch forward", error.as_ref());
+                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
+                        continue;
+                    }
 
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -579,17 +661,56 @@ async fn run_udp_tunnel(
                             let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
                                 Ok(result) => result,
                                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(error) => return Err(error.into()),
+                                Err(error) => {
+                                    log_tunnel_worker_error("UDP", &tunnel_name, "recv_from", &error);
+                                    break;
+                                }
                             };
 
                             if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-                                let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
-                                entry.insert(session);
+                                match create_udp_session(
+                                    client_addr,
+                                    spec.target.clone(),
+                                    listener.clone(),
+                                    stop_rx.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(session) => {
+                                        entry.insert(session);
+                                    }
+                                    Err(error) => {
+                                        log_tunnel_worker_error(
+                                            "UDP",
+                                            &tunnel_name,
+                                            "create session",
+                                            error.as_ref(),
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
 
+                            let mut remove_session = false;
                             if let Some(session) = sessions.get_mut(&client_addr) {
                                 session.last_seen = Instant::now();
-                                send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                                if let Err(error) =
+                                    send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await
+                                {
+                                    log_tunnel_worker_error(
+                                        "UDP",
+                                        &tunnel_name,
+                                        "send to upstream",
+                                        &error,
+                                    );
+                                    remove_session = true;
+                                }
+                            }
+
+                            if remove_session
+                                && let Some(session) = sessions.remove(&client_addr)
+                            {
+                                retire_udp_session(session);
                             }
                         }
                     }
@@ -732,7 +853,31 @@ async fn shutdown_udp_sessions(sessions: HashMap<std::net::SocketAddr, UdpSessio
     }
 
     for handle in handles {
-        let _ = handle.await;
+        wait_for_task_shutdown(handle, "UDP session worker").await;
+    }
+}
+
+async fn wait_for_task_shutdown(handle: JoinHandle<()>, label: &str) {
+    let mut handle = Box::pin(handle);
+    let abort_handle = handle.abort_handle();
+
+    match timeout(SHUTDOWN_GRACE_PERIOD, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !error.is_cancelled() {
+                eprintln!("{label} failed while stopping: {}", error);
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "Warning: {label} did not stop within {:?}; aborting it.",
+                SHUTDOWN_GRACE_PERIOD
+            );
+            abort_handle.abort();
+            if let Err(error) = handle.await && !error.is_cancelled() {
+                eprintln!("{label} failed after abort: {}", error);
+            }
+        }
     }
 }
 
