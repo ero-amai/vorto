@@ -1,5 +1,10 @@
 # vorto
 
+[![github ci](https://github.com/ero-amai/vorto/actions/workflows/release.yml/badge.svg)](https://github.com/ero-amai/vorto/actions/workflows/release.yml)
+[![protocol](https://img.shields.io/badge/protocol-TCP%20%7C%20UDP-success?style=flat-square)](./README.zh-CN.md#功能特性)
+[![mode](https://img.shields.io/badge/mode-foreground%20%7C%20daemon-1f6feb?style=flat-square)](./README.zh-CN.md#快速开始)
+[![config](https://img.shields.io/badge/config-hot--reload-informational?style=flat-square)](./README.zh-CN.md#功能特性)
+
 [English](./README.md)
 
 `vorto` 是一个轻量的 Rust 端口转发工具，支持 TCP 和 UDP 隧道。
@@ -66,6 +71,12 @@ cargo build --release
 
 ```bash
 ./vorto status
+```
+
+查看内嵌版本信息：
+
+```bash
+./vorto version
 ```
 
 停止后台进程：
@@ -165,7 +176,7 @@ Action [a/e/t/d/s/q]:
 
 - TCP 转发在 Tokio 支持的平台上都能工作
 - Linux 下的大流量 TCP 性能最好，因为吞吐路径使用了 `splice`
-- UDP 转发目前是用户态实现
+- UDP 转发目前是用户态实现（在 Linux 下有基于 recvmmsg/sendmmsg 的批量收发优化）
 
 ## 开发
 
