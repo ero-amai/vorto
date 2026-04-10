@@ -397,7 +397,8 @@ async fn splice_one_way(source: Arc<TcpStream>, destination: Arc<TcpStream>) -> 
             )
         }) {
             Ok(copied) => copied,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
         };
 
         if copied == 0 {
@@ -416,7 +417,8 @@ async fn splice_one_way(source: Arc<TcpStream>, destination: Arc<TcpStream>) -> 
                 )
             }) {
                 Ok(moved) => moved,
-                Err(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
             };
 
             if moved == 0 {
