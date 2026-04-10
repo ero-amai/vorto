@@ -20,6 +20,8 @@ pub struct TunnelConfig {
     pub listen: String,
     pub target: String,
     pub protocol: Protocol,
+    #[serde(default = "default_tcp_mode")]
+    pub tcp_mode: TcpMode,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -32,8 +34,21 @@ pub enum Protocol {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TcpMode {
+    #[default]
+    Auto,
+    Throughput,
+    Latency,
+}
+
 fn default_enabled() -> bool {
     true
+}
+
+fn default_tcp_mode() -> TcpMode {
+    TcpMode::Auto
 }
 
 impl Default for TunnelConfig {
@@ -43,6 +58,7 @@ impl Default for TunnelConfig {
             listen: "0.0.0.0:0".to_string(),
             target: "127.0.0.1:0".to_string(),
             protocol: Protocol::Tcp,
+            tcp_mode: TcpMode::Auto,
             enabled: true,
         }
     }
@@ -62,6 +78,23 @@ impl Protocol {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
             Self::Both => "both",
+        }
+    }
+}
+
+impl TcpMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Throughput => "throughput",
+            Self::Latency => "latency",
+        }
+    }
+
+    pub fn effective(self) -> Self {
+        match self {
+            Self::Auto => Self::Throughput,
+            explicit => explicit,
         }
     }
 }
@@ -218,6 +251,7 @@ mod tests {
                 listen: "127.0.0.1:18080".to_string(),
                 target: "127.0.0.1:8080".to_string(),
                 protocol: Protocol::Tcp,
+                tcp_mode: TcpMode::Latency,
                 enabled: true,
             }],
         };
@@ -227,5 +261,22 @@ mod tests {
         assert_eq!(loaded, config);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_defaults_tcp_mode_to_auto_for_older_configs() {
+        let config = AppConfig::parse(
+            "tunnels:\n  - name: legacy\n    listen: 127.0.0.1:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+        )
+        .expect("older config should still parse");
+
+        assert_eq!(config.tunnels.len(), 1);
+        assert_eq!(config.tunnels[0].tcp_mode, TcpMode::Auto);
+    }
+
+    #[test]
+    fn tcp_mode_auto_defaults_to_throughput_at_runtime() {
+        assert_eq!(TcpMode::Auto.effective(), TcpMode::Throughput);
+        assert_eq!(TcpMode::Latency.effective(), TcpMode::Latency);
     }
 }

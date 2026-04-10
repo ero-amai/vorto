@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
@@ -19,11 +18,10 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
-use crate::config::{AppConfig, TunnelConfig};
+use crate::config::{AppConfig, TcpMode, TunnelConfig};
 
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-#[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 #[cfg(target_os = "linux")]
 const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
@@ -205,9 +203,10 @@ async fn run_tcp_tunnel(
             result = listener.accept() => {
                 let (inbound, _) = result?;
                 let target = spec.target.clone();
+                let tcp_mode = spec.tcp_mode;
                 let connection_stop = stop_rx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
+                    if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
                         eprintln!("TCP connection handling failed: {}", error);
                     }
                 });
@@ -224,6 +223,7 @@ async fn run_tcp_tunnel(
 async fn handle_tcp_connection(
     inbound: TcpStream,
     target: &str,
+    tcp_mode: TcpMode,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let outbound = tokio::select! {
@@ -231,30 +231,49 @@ async fn handle_tcp_connection(
         _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
     };
 
+    configure_tcp_streams(&inbound, &outbound, tcp_mode)?;
+
     #[cfg(target_os = "linux")]
     {
-        handle_tcp_connection_splice(inbound, outbound, stop_rx).await
+        match tcp_mode.effective() {
+            TcpMode::Throughput => handle_tcp_connection_splice(inbound, outbound, stop_rx).await,
+            TcpMode::Latency => handle_tcp_connection_copy(inbound, outbound, stop_rx).await,
+            TcpMode::Auto => unreachable!("auto mode should resolve before selecting a runtime path"),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let mut inbound = inbound;
-        let mut outbound = outbound;
-
-        tokio::select! {
-            result = copy_bidirectional_with_sizes(
-                &mut inbound,
-                &mut outbound,
-                TCP_COPY_BUFFER_SIZE,
-                TCP_COPY_BUFFER_SIZE,
-            ) => {
-                result?;
-            }
-            _ = wait_for_shutdown(&mut stop_rx) => {}
-        }
-
-        Ok(())
+        let _ = tcp_mode;
+        handle_tcp_connection_copy(inbound, outbound, stop_rx).await
     }
+}
+
+fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream, tcp_mode: TcpMode) -> io::Result<()> {
+    let nodelay = matches!(tcp_mode.effective(), TcpMode::Latency);
+    inbound.set_nodelay(nodelay)?;
+    outbound.set_nodelay(nodelay)?;
+    Ok(())
+}
+
+async fn handle_tcp_connection_copy(
+    mut inbound: TcpStream,
+    mut outbound: TcpStream,
+    mut stop_rx: watch::Receiver<bool>,
+) -> AppResult<()> {
+    tokio::select! {
+        result = copy_bidirectional_with_sizes(
+            &mut inbound,
+            &mut outbound,
+            TCP_COPY_BUFFER_SIZE,
+            TCP_COPY_BUFFER_SIZE,
+        ) => {
+            result?;
+        }
+        _ = wait_for_shutdown(&mut stop_rx) => {}
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
