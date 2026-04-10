@@ -6,117 +6,130 @@ use crate::config::{AppConfig, Protocol, TunnelConfig};
 
 pub fn manage_config(path: &Path) -> AppResult<()> {
     let mut config = AppConfig::load_or_default(path)?;
+    let mut dirty = false;
 
     loop {
-        render_tunnels(&config);
-        println!();
-        println!("Select an action:");
-        println!("1. Add tunnel");
-        println!("2. Edit tunnel");
-        println!("3. Delete tunnel");
-        println!("4. Save and exit");
-        println!("5. Exit without saving");
+        render_dashboard(path, &config, dirty);
 
-        match prompt("Choice")?.trim() {
-            "1" => add_tunnel(&mut config)?,
-            "2" => edit_tunnel(&mut config)?,
-            "3" => delete_tunnel(&mut config)?,
-            "4" => {
+        match prompt("Action [a/e/t/d/s/q]")?.trim().to_ascii_lowercase().as_str() {
+            "a" | "add" => dirty |= add_tunnel(&mut config)?,
+            "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
+            "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
+            "d" | "delete" => dirty |= delete_tunnel(&mut config)?,
+            "s" | "save" => {
                 config.save(path)?;
                 println!("Saved configuration to {}.", path.display());
                 return Ok(());
             }
-            "5" => {
-                println!("Exited without saving.");
+            "q" | "quit" => {
+                if dirty && !prompt_bool("Discard unsaved changes? [y/N]", false)? {
+                    println!("Nothing was discarded.");
+                    continue;
+                }
+                println!("Exited configuration editor.");
                 return Ok(());
             }
-            _ => println!("Invalid choice. Please try again."),
+            "" => {}
+            _ => println!("Unknown action. Use a, e, t, d, s, or q."),
         }
     }
 }
 
-fn render_tunnels(config: &AppConfig) {
-    println!("Configured tunnels:");
+fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
+    println!();
+    println!("Config editor");
+    println!("File: {}", path.display());
+    println!(
+        "Tunnels: {} total, {} enabled, {} disabled{}",
+        config.tunnels.len(),
+        config.tunnels.iter().filter(|tunnel| tunnel.enabled).count(),
+        config.tunnels.iter().filter(|tunnel| !tunnel.enabled).count(),
+        if dirty { " | unsaved changes" } else { "" }
+    );
+    println!();
+    println!(
+        "{:<4} {:<18} {:<8} {:<10} {:<24} Local listen",
+        "No.",
+        "Name",
+        "Proto",
+        "State",
+        "Remote target",
+    );
+    println!("{}", "-".repeat(88));
+
     if config.tunnels.is_empty() {
-        println!("  (none)");
-        return;
+        println!("(no tunnels configured)");
+    } else {
+        for (index, tunnel) in config.tunnels.iter().enumerate() {
+            println!(
+                "{:<4} {:<18} {:<8} {:<10} {:<24} {}",
+                index + 1,
+                truncate(&tunnel.name, 18),
+                tunnel.protocol.label(),
+                if tunnel.enabled { "enabled" } else { "disabled" },
+                truncate(&tunnel.target, 24),
+                tunnel.listen
+            );
+        }
     }
 
-    for (index, tunnel) in config.tunnels.iter().enumerate() {
-        println!(
-            "  {}. {} | {} | {} -> {} | {}",
-            index + 1,
-            tunnel.name,
-            tunnel.protocol.label(),
-            tunnel.listen,
-            tunnel.target,
-            if tunnel.enabled { "enabled" } else { "disabled" }
-        );
-    }
+    println!();
+    println!("Actions:");
+    println!("  a = add tunnel");
+    println!("  e = edit tunnel");
+    println!("  t = toggle enabled/disabled");
+    println!("  d = delete tunnel");
+    println!("  s = save and exit");
+    println!("  q = quit");
+    println!();
 }
 
-fn add_tunnel(config: &mut AppConfig) -> AppResult<()> {
-    println!("Add a new tunnel:");
-    let name = loop {
-        let input = prompt("Name")?;
-        let name = input.trim();
-        if name.is_empty() {
-            println!("Name cannot be empty.");
-            continue;
-        }
-        if config.tunnels.iter().any(|tunnel| tunnel.name == name) {
-            println!("That name already exists. Please choose another.");
-            continue;
-        }
-        break name.to_string();
-    };
+fn add_tunnel(config: &mut AppConfig) -> AppResult<bool> {
+    println!("Add tunnel");
+    println!("Press Ctrl+C to abort at any time.");
 
+    let name = prompt_new_name(config, None)?;
     let protocol = prompt_protocol(None)?;
-    let listen = prompt_socket_addr("Listen address (for example 0.0.0.0:8080)", None)?;
-    let target = prompt_socket_addr("Target address (for example 127.0.0.1:80)", None)?;
-    let enabled = prompt_bool("Enable this tunnel? [Y/n]", true)?;
+    let target = prompt_socket_addr("Remote target address (host:port)", None)?;
+    let listen = prompt_socket_addr("Local listen address (host:port)", None)?;
+    let enabled = prompt_bool("Enable this tunnel now? [Y/n]", true)?;
 
     let tunnel = TunnelConfig {
         name,
-        listen,
-        target,
         protocol,
+        target,
+        listen,
         enabled,
     };
     tunnel.validate()?;
+
+    println!();
+    println!("New tunnel summary:");
+    print_tunnel_details(&tunnel);
+    if !prompt_bool("Create this tunnel? [Y/n]", true)? {
+        println!("Creation cancelled.");
+        return Ok(false);
+    }
+
     config.tunnels.push(tunnel);
-    Ok(())
+    println!("Tunnel added.");
+    Ok(true)
 }
 
-fn edit_tunnel(config: &mut AppConfig) -> AppResult<()> {
-    if config.tunnels.is_empty() {
-        println!("There are no tunnels to edit.");
-        return Ok(());
-    }
+fn edit_tunnel(config: &mut AppConfig) -> AppResult<bool> {
+    let Some(index) = select_tunnel(config, "edit")? else {
+        return Ok(false);
+    };
 
-    let index = prompt_index("Tunnel number to edit", config.tunnels.len())?;
     let mut tunnel = config.tunnels[index].clone();
+    println!();
+    println!("Editing '{}':", tunnel.name);
+    print_tunnel_details(&tunnel);
 
-    let new_name = prompt_optional("Name", Some(tunnel.name.as_str()))?;
-    let new_name = new_name.trim().to_string();
-    if new_name != tunnel.name {
-        if new_name.is_empty() {
-            println!("Name left empty. Keeping the current value.");
-        } else if config
-            .tunnels
-            .iter()
-            .enumerate()
-            .any(|(idx, item)| idx != index && item.name == new_name)
-        {
-            println!("That name is already in use. Keeping the current value.");
-        } else {
-            tunnel.name = new_name;
-        }
-    }
-
+    tunnel.name = prompt_new_name(config, Some(index))?;
     tunnel.protocol = prompt_protocol(Some(tunnel.protocol))?;
-    tunnel.listen = prompt_socket_addr("Listen address", Some(tunnel.listen.as_str()))?;
-    tunnel.target = prompt_socket_addr("Target address", Some(tunnel.target.as_str()))?;
+    tunnel.target = prompt_socket_addr("Remote target address", Some(tunnel.target.as_str()))?;
+    tunnel.listen = prompt_socket_addr("Local listen address", Some(tunnel.listen.as_str()))?;
     tunnel.enabled = prompt_bool(
         if tunnel.enabled {
             "Enable this tunnel? [Y/n]"
@@ -125,60 +138,135 @@ fn edit_tunnel(config: &mut AppConfig) -> AppResult<()> {
         },
         tunnel.enabled,
     )?;
-
     tunnel.validate()?;
+
+    println!();
+    println!("Updated tunnel summary:");
+    print_tunnel_details(&tunnel);
+    if !prompt_bool("Apply these changes? [Y/n]", true)? {
+        println!("Edit cancelled.");
+        return Ok(false);
+    }
+
     config.tunnels[index] = tunnel;
-    Ok(())
+    println!("Tunnel updated.");
+    Ok(true)
 }
 
-fn delete_tunnel(config: &mut AppConfig) -> AppResult<()> {
-    if config.tunnels.is_empty() {
-        println!("There are no tunnels to delete.");
-        return Ok(());
-    }
+fn toggle_tunnel(config: &mut AppConfig) -> AppResult<bool> {
+    let Some(index) = select_tunnel(config, "toggle")? else {
+        return Ok(false);
+    };
 
-    let index = prompt_index("Tunnel number to delete", config.tunnels.len())?;
+    let tunnel = &mut config.tunnels[index];
+    tunnel.enabled = !tunnel.enabled;
+    println!(
+        "Tunnel '{}' is now {}.",
+        tunnel.name,
+        if tunnel.enabled { "enabled" } else { "disabled" }
+    );
+    Ok(true)
+}
+
+fn delete_tunnel(config: &mut AppConfig) -> AppResult<bool> {
+    let Some(index) = select_tunnel(config, "delete")? else {
+        return Ok(false);
+    };
+
     let tunnel = &config.tunnels[index];
-    if prompt_bool(&format!("Delete tunnel '{}' ? [y/N]", tunnel.name), false)? {
-        config.tunnels.remove(index);
-        println!("Tunnel deleted.");
-    } else {
+    println!();
+    println!("Delete tunnel:");
+    print_tunnel_details(tunnel);
+
+    if !prompt_bool(&format!("Delete '{}' ? [y/N]", tunnel.name), false)? {
         println!("Delete cancelled.");
+        return Ok(false);
     }
 
-    Ok(())
+    config.tunnels.remove(index);
+    println!("Tunnel deleted.");
+    Ok(true)
 }
 
-fn prompt_index(label: &str, max: usize) -> AppResult<usize> {
+fn select_tunnel(config: &AppConfig, action: &str) -> AppResult<Option<usize>> {
+    if config.tunnels.is_empty() {
+        println!("There are no tunnels to {}.", action);
+        return Ok(None);
+    }
+
     loop {
-        let input = prompt(label)?;
-        match input.trim().parse::<usize>() {
-            Ok(value) if (1..=max).contains(&value) => return Ok(value - 1),
-            _ => println!("Please enter a number between 1 and {}.", max),
+        let input = prompt("Tunnel number or name (blank to cancel)")?;
+        let value = input.trim();
+        if value.is_empty() {
+            println!("Selection cancelled.");
+            return Ok(None);
         }
+
+        if let Ok(number) = value.parse::<usize>()
+            && (1..=config.tunnels.len()).contains(&number)
+        {
+            return Ok(Some(number - 1));
+        }
+
+        if let Some((index, _)) = config
+            .tunnels
+            .iter()
+            .enumerate()
+            .find(|(_, tunnel)| tunnel.name.eq_ignore_ascii_case(value))
+        {
+            return Ok(Some(index));
+        }
+
+        println!("No tunnel matched '{}'.", value);
+    }
+}
+
+fn prompt_new_name(config: &AppConfig, current_index: Option<usize>) -> AppResult<String> {
+    let current_name = current_index.map(|index| config.tunnels[index].name.as_str());
+
+    loop {
+        let input = prompt_optional("Name", current_name)?;
+        let value = input.trim();
+
+        let name = if value.is_empty() {
+            if let Some(current) = current_name {
+                current.to_string()
+            } else {
+                println!("Name cannot be empty.");
+                continue;
+            }
+        } else {
+            value.to_string()
+        };
+
+        let duplicate = config.tunnels.iter().enumerate().any(|(index, tunnel)| {
+            Some(index) != current_index && tunnel.name.eq_ignore_ascii_case(&name)
+        });
+        if duplicate {
+            println!("That name is already in use.");
+            continue;
+        }
+
+        return Ok(name);
     }
 }
 
 fn prompt_protocol(current: Option<Protocol>) -> AppResult<Protocol> {
     loop {
-        println!("Select protocol: 1. TCP  2. UDP  3. Both");
-        let default = current.map(|protocol| match protocol {
-            Protocol::Tcp => "1",
-            Protocol::Udp => "2",
-            Protocol::Both => "3",
-        });
-        let input = prompt_optional("Protocol", default)?;
-        let value = input.trim();
+        let default_label = current.map_or("none", Protocol::label);
+        println!("Protocol options: tcp, udp, both");
+        let input = prompt(&format!("Protocol [default: {}]", default_label))?;
+        let value = input.trim().to_ascii_lowercase();
 
         let selected = if value.is_empty() {
             current
         } else {
-            match value {
-                "1" => Some(Protocol::Tcp),
-                "2" => Some(Protocol::Udp),
-                "3" => Some(Protocol::Both),
+            match value.as_str() {
+                "1" | "tcp" => Some(Protocol::Tcp),
+                "2" | "udp" => Some(Protocol::Udp),
+                "3" | "both" => Some(Protocol::Both),
                 _ => {
-                    println!("Invalid choice. Please try again.");
+                    println!("Invalid protocol. Use tcp, udp, or both.");
                     continue;
                 }
             }
@@ -225,6 +313,27 @@ fn prompt_bool(label: &str, default: bool) -> AppResult<bool> {
     }
 }
 
+fn print_tunnel_details(tunnel: &TunnelConfig) {
+    println!("  Name         : {}", tunnel.name);
+    println!("  Protocol     : {}", tunnel.protocol.label());
+    println!("  Remote target: {}", tunnel.target);
+    println!("  Local listen : {}", tunnel.listen);
+    println!(
+        "  State        : {}",
+        if tunnel.enabled { "enabled" } else { "disabled" }
+    );
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let shortened = chars.by_ref().take(width).collect::<String>();
+    if chars.next().is_some() && width > 3 {
+        format!("{}...", shortened.chars().take(width - 3).collect::<String>())
+    } else {
+        shortened
+    }
+}
+
 fn prompt_optional(label: &str, current: Option<&str>) -> AppResult<String> {
     let suffix = current
         .filter(|value| !value.is_empty())
@@ -234,7 +343,8 @@ fn prompt_optional(label: &str, current: Option<&str>) -> AppResult<String> {
 }
 
 fn prompt(label: &str) -> AppResult<String> {
-    print!("{}: ", label);
+    println!("{}:", label);
+    print!("└─ ");
     io::stdout().flush()?;
 
     let mut input = String::new();

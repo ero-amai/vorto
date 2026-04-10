@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn daemon_worker_cmdline_rejects_other_processes() {
         assert!(!is_daemon_worker_cmdline(b"/usr/bin/python3\0server.py\0", "vorto"));
-        assert!(!is_daemon_worker_cmdline(b"/tmp/vorto\0__daemon_worker\0", "vorto"));
+        assert!(!is_daemon_worker_cmdline(b"/tmp/rttf\0__daemon_worker\0", "vorto"));
         assert!(!is_daemon_worker_cmdline(b"/tmp/vorto\0run\0", "vorto"));
     }
 }
