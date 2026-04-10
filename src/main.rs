@@ -5,7 +5,7 @@ mod version;
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,7 +43,7 @@ async fn entry() -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("config") | Some("create") => interactive::manage_config(&config_path),
         Some("run") => runtime::run_foreground(&config_path).await,
-        Some("daemon") => start_daemon(&cwd, &pid_path, &log_path),
+        Some("daemon") => start_daemon(&cwd, &config_path, &pid_path, &log_path),
         Some("stop") => stop_daemon(&pid_path),
         Some("status") => print_status(&pid_path),
         Some("version") | Some("-V") | Some("--version") => {
@@ -65,7 +65,7 @@ async fn entry() -> AppResult<()> {
     }
 }
 
-fn start_daemon(cwd: &Path, pid_path: &Path, log_path: &Path) -> AppResult<()> {
+fn start_daemon(cwd: &Path, config_path: &Path, pid_path: &Path, log_path: &Path) -> AppResult<()> {
     if let Some(pid) = read_pid(pid_path)? {
         if daemon_process_matches(pid)? {
             println!("Daemon is already running with PID {}.", pid);
@@ -74,13 +74,9 @@ fn start_daemon(cwd: &Path, pid_path: &Path, log_path: &Path) -> AppResult<()> {
         let _ = fs::remove_file(pid_path);
     }
 
-    AppConfig::load_for_runtime(&cwd.join(CONFIG_FILE))?;
+    let config = AppConfig::load_for_runtime(config_path)?;
 
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let stderr = stdout.try_clone()?;
+    let (stdout, stderr) = daemon_stdio(config.daemon_log, log_path)?;
 
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
@@ -107,12 +103,43 @@ fn start_daemon(cwd: &Path, pid_path: &Path, log_path: &Path) -> AppResult<()> {
 
     let child = command.spawn()?;
     fs::write(pid_path, format!("{}\n", child.id()))?;
-    println!(
-        "Daemon started with PID {}. Log file: {}",
-        child.id(),
-        log_path.display()
-    );
+    if config.daemon_log {
+        println!(
+            "Daemon started with PID {}. Log file: {}",
+            child.id(),
+            log_path.display()
+        );
+    } else {
+        println!("Daemon started with PID {}. Log file output is disabled.", child.id());
+    }
     Ok(())
+}
+
+fn daemon_stdio(log_enabled: bool, log_path: &Path) -> AppResult<(Stdio, Stdio)> {
+    if log_enabled {
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        let stderr = stdout.try_clone()?;
+        Ok((Stdio::from(stdout), Stdio::from(stderr)))
+    } else {
+        let stdout = File::open(null_device_path())?;
+        let stderr = stdout.try_clone()?;
+        Ok((Stdio::from(stdout), Stdio::from(stderr)))
+    }
+}
+
+fn null_device_path() -> &'static str {
+    #[cfg(windows)]
+    {
+        "NUL"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "/dev/null"
+    }
 }
 
 fn stop_daemon(pid_path: &Path) -> AppResult<()> {

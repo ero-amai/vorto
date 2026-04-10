@@ -90,6 +90,8 @@ cargo build --release
 示例 `config.yaml`：
 
 ```yaml
+daemon_log: true
+
 tunnels:
   - name: web
     enabled: true
@@ -115,6 +117,7 @@ tunnels:
 
 ### 字段说明
 
+- `daemon_log`：后台模式是否将 stdout/stderr 写入 `./vorto.log`
 - `name`：唯一的 tunnel 名称
 - `enabled`：是否启用该 tunnel
 - `protocol`：`tcp`、`udp` 或 `both`
@@ -146,6 +149,8 @@ tunnels:
 - 启动新增加的 tunnel
 - 仅重启真正发生变化的 tunnel
 - 未变化的 tunnel 会保持运行，不会被无意义断流
+- `daemon_log: true` 时会把后台进程输出写到 `./vorto.log`
+- `daemon_log: false` 时会丢弃后台进程输出
 
 如果配置重载失败，后台模式会保留当前正在运行的 tunnel，并在下一次轮询时继续重试。
 
@@ -163,6 +168,7 @@ tunnels:
 - 编辑 tunnel
 - 启用或禁用 tunnel
 - 删除 tunnel
+- 切换后台日志文件开关
 - 将修改保存回 `config.yaml`
 
 输入提示会换行显示，便于阅读：

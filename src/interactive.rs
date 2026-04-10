@@ -11,7 +11,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
     loop {
         render_dashboard(path, &config, dirty);
 
-        match prompt("Action [a/e/t/d/s/q]")?
+        match prompt("Action [a/e/t/d/l/s/q]")?
             .trim()
             .to_ascii_lowercase()
             .as_str()
@@ -20,6 +20,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
             "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
             "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
             "d" | "delete" => dirty |= delete_tunnel(&mut config)?,
+            "l" | "log" => dirty |= toggle_daemon_log(&mut config),
             "s" | "save" => {
                 config.save(path)?;
                 println!("Saved configuration to {}.", path.display());
@@ -34,7 +35,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
                 return Ok(());
             }
             "" => {}
-            _ => println!("Unknown action. Use a, e, t, d, s, or q."),
+            _ => println!("Unknown action. Use a, e, t, d, l, s, or q."),
         }
     }
 }
@@ -57,6 +58,14 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
             .filter(|tunnel| !tunnel.enabled)
             .count(),
         if dirty { " | unsaved changes" } else { "" }
+    );
+    println!(
+        "Daemon log file: {}",
+        if config.daemon_log {
+            "enabled (./vorto.log)"
+        } else {
+            "disabled"
+        }
     );
     println!();
     println!(
@@ -92,6 +101,7 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     println!("  e = edit tunnel");
     println!("  t = toggle enabled/disabled");
     println!("  d = delete tunnel");
+    println!("  l = toggle daemon log file");
     println!("  s = save and exit");
     println!("  q = quit");
     println!();
@@ -206,6 +216,19 @@ fn delete_tunnel(config: &mut AppConfig) -> AppResult<bool> {
     config.tunnels.remove(index);
     println!("Tunnel deleted.");
     Ok(true)
+}
+
+fn toggle_daemon_log(config: &mut AppConfig) -> bool {
+    config.daemon_log = !config.daemon_log;
+    println!(
+        "Daemon log file is now {}.",
+        if config.daemon_log {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    true
 }
 
 fn select_tunnel(config: &AppConfig, action: &str) -> AppResult<Option<usize>> {
