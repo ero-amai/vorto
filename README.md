@@ -1,9 +1,9 @@
 # vorto
 
 [![github ci](https://github.com/ero-amai/vorto/actions/workflows/release.yml/badge.svg)](https://github.com/ero-amai/vorto/actions/workflows/release.yml)
-[![protocol](https://img.shields.io/badge/protocol-TCP%20%7C%20UDP-success?style=flat-square)](./README.md#features)
-[![mode](https://img.shields.io/badge/mode-foreground%20%7C%20daemon-1f6feb?style=flat-square)](./README.md#quick-start)
-[![config](https://img.shields.io/badge/config-hot--reload-informational?style=flat-square)](./README.md#features)
+[![protocol](https://img.shields.io/badge/protocol-TCP%20%7C%20UDP-success?style=flat)](./README.md#features)
+[![mode](https://img.shields.io/badge/mode-foreground%20%7C%20daemon-1f6feb?style=flat)](./README.md#quick-start)
+[![config](https://img.shields.io/badge/config-hot--reload-informational?style=flat)](./README.md#features)
 
 [简体中文](./README.zh-CN.md)
 
