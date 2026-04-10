@@ -2,6 +2,8 @@
 name = "vorto"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+repository = "https://github.com/ero-amai/vorto"
 
 [dependencies]
 libc = "0.2"

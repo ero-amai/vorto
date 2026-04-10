@@ -1,6 +1,7 @@
 mod config;
 mod interactive;
 mod runtime;
+mod version;
 
 use std::env;
 use std::ffi::OsStr;
@@ -44,6 +45,14 @@ async fn entry() -> AppResult<()> {
         Some("daemon") => start_daemon(&cwd, &pid_path, &log_path),
         Some("stop") => stop_daemon(&pid_path),
         Some("status") => print_status(&pid_path),
+        Some("version") | Some("-V") | Some("--version") => {
+            version::print();
+            Ok(())
+        }
+        Some("help") | Some("-h") | Some("--help") => {
+            print_help();
+            Ok(())
+        }
         Some(DAEMON_WORKER) => {
             let _pid_guard = PidFileGuard::new(&pid_path)?;
             runtime::run_config_watcher(&config_path, Duration::from_secs(DEFAULT_POLL_SECS)).await
@@ -144,6 +153,8 @@ fn print_help() {
     println!("  ./vorto daemon   Run in the background (hot-reload ./config.yaml changes)");
     println!("  ./vorto stop     Stop the background process");
     println!("  ./vorto status   Show background process status");
+    println!("  ./vorto version  Show release, commit, and repository information");
+    println!("  ./vorto help     Show this help message");
 }
 
 fn read_pid(path: &Path) -> AppResult<Option<i32>> {
