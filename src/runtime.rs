@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::copy_bidirectional_with_sizes;
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -14,8 +14,10 @@ use tokio::time::{MissedTickBehavior, interval};
 
 #[cfg(target_os = "linux")]
 use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
 use crate::config::{AppConfig, TcpMode, TunnelConfig};
@@ -23,6 +25,12 @@ use crate::config::{AppConfig, TcpMode, TunnelConfig};
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
+const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
+const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+const UDP_PACKET_BUFFER_SIZE: usize = 65_535;
+const UDP_DRAIN_BURST: usize = 64;
+#[cfg(target_os = "linux")]
+const UDP_RECV_BATCH_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
 const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
 #[cfg(target_os = "linux")]
@@ -122,6 +130,7 @@ impl ActiveTunnel {
 
         if spec.protocol.supports_udp() {
             let udp_socket = Arc::new(UdpSocket::bind(&spec.listen).await?);
+            configure_udp_socket(udp_socket.as_ref())?;
             let udp_spec = spec.clone();
             let udp_stop = stop_rx.clone();
             handles.push(tokio::spawn(async move {
@@ -171,12 +180,17 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
                     if applied {
                         last_applied_config = Some(config);
                     } else {
-                        eprintln!("Will retry the current config on the next poll because some tunnels failed to start.");
+                        eprintln!(
+                            "Will retry the current config on the next poll because some tunnels failed to start."
+                        );
                     }
                 }
             }
             Err(error) => {
-                eprintln!("Failed to read config. Keeping current tunnels unchanged: {}", error);
+                eprintln!(
+                    "Failed to read config. Keeping current tunnels unchanged: {}",
+                    error
+                );
             }
         }
 
@@ -238,7 +252,9 @@ async fn handle_tcp_connection(
         match tcp_mode.effective() {
             TcpMode::Throughput => handle_tcp_connection_splice(inbound, outbound, stop_rx).await,
             TcpMode::Latency => handle_tcp_connection_copy(inbound, outbound, stop_rx).await,
-            TcpMode::Auto => unreachable!("auto mode should resolve before selecting a runtime path"),
+            TcpMode::Auto => {
+                unreachable!("auto mode should resolve before selecting a runtime path")
+            }
         }
     }
 
@@ -249,10 +265,55 @@ async fn handle_tcp_connection(
     }
 }
 
-fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream, tcp_mode: TcpMode) -> io::Result<()> {
+fn configure_tcp_streams(
+    inbound: &TcpStream,
+    outbound: &TcpStream,
+    tcp_mode: TcpMode,
+) -> io::Result<()> {
     let nodelay = matches!(tcp_mode.effective(), TcpMode::Latency);
     inbound.set_nodelay(nodelay)?;
     outbound.set_nodelay(nodelay)?;
+    #[cfg(unix)]
+    {
+        tune_socket_buffers(
+            inbound.as_raw_fd(),
+            TCP_SOCKET_BUFFER_SIZE,
+            TCP_SOCKET_BUFFER_SIZE,
+        )?;
+        tune_socket_buffers(
+            outbound.as_raw_fd(),
+            TCP_SOCKET_BUFFER_SIZE,
+            TCP_SOCKET_BUFFER_SIZE,
+        )?;
+    }
+    #[cfg(target_os = "linux")]
+    if nodelay {
+        set_socket_option(
+            inbound.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            1,
+        )?;
+        set_socket_option(
+            outbound.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        tune_socket_buffers(
+            socket.as_raw_fd(),
+            UDP_SOCKET_BUFFER_SIZE,
+            UDP_SOCKET_BUFFER_SIZE,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -428,24 +489,48 @@ async fn run_udp_tunnel(
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let mut sessions = HashMap::<std::net::SocketAddr, UdpSession>::new();
-    let mut buffer = vec![0_u8; 65_535];
+    #[cfg(target_os = "linux")]
+    let mut batch = UdpRecvBatch::new(UDP_RECV_BATCH_SIZE);
+    #[cfg(not(target_os = "linux"))]
+    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_SIZE];
     let mut cleanup_tick = interval(UDP_CLEANUP_INTERVAL);
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     cleanup_tick.tick().await;
 
     loop {
         tokio::select! {
-            result = listener.recv_from(&mut buffer) => {
-                let (size, client_addr) = result?;
+            readiness = listener.readable() => {
+                readiness?;
 
-                if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-                    let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
-                    entry.insert(session);
-                }
+                #[cfg(target_os = "linux")]
+                forward_udp_listener_batch(
+                    &listener,
+                    spec.target.as_str(),
+                    &mut sessions,
+                    &stop_rx,
+                    &mut batch,
+                )
+                .await?;
 
-                if let Some(session) = sessions.get_mut(&client_addr) {
-                    session.last_seen = Instant::now();
-                    session.upstream.send(&buffer[..size]).await?;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    for _ in 0..UDP_DRAIN_BURST {
+                        let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
+                            Ok(result) => result,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error.into()),
+                        };
+
+                        if let Entry::Vacant(entry) = sessions.entry(client_addr) {
+                            let session = create_udp_session(client_addr, spec.target.clone(), listener.clone(), stop_rx.clone()).await?;
+                            entry.insert(session);
+                        }
+
+                        if let Some(session) = sessions.get_mut(&client_addr) {
+                            session.last_seen = Instant::now();
+                            send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await?;
+                        }
+                    }
                 }
             }
             _ = cleanup_tick.tick() => {
@@ -462,6 +547,58 @@ async fn run_udp_tunnel(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn forward_udp_listener_batch(
+    listener: &Arc<UdpSocket>,
+    target: &str,
+    sessions: &mut HashMap<std::net::SocketAddr, UdpSession>,
+    global_stop_rx: &watch::Receiver<bool>,
+    batch: &mut UdpRecvBatch,
+) -> AppResult<()> {
+    let received = batch.recv(listener.as_ref().as_raw_fd())?;
+    if received == 0 {
+        return Ok(());
+    }
+
+    let mut grouped = Vec::<(std::net::SocketAddr, Vec<usize>)>::new();
+
+    for index in 0..received {
+        let client_addr = batch.client_addr(index)?;
+
+        if let Entry::Vacant(entry) = sessions.entry(client_addr) {
+            let session = create_udp_session(
+                client_addr,
+                target.to_string(),
+                listener.clone(),
+                global_stop_rx.clone(),
+            )
+            .await?;
+            entry.insert(session);
+        }
+
+        if let Some(session) = sessions.get_mut(&client_addr) {
+            session.last_seen = Instant::now();
+        }
+
+        if let Some((_, packet_indexes)) = grouped
+            .iter_mut()
+            .find(|(group_client_addr, _)| *group_client_addr == client_addr)
+        {
+            packet_indexes.push(index);
+        } else {
+            grouped.push((client_addr, vec![index]));
+        }
+    }
+
+    for (client_addr, packet_indexes) in grouped {
+        if let Some(session) = sessions.get(&client_addr) {
+            send_udp_batch_connected(session.upstream.as_ref(), batch, &packet_indexes).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn create_udp_session(
     client_addr: std::net::SocketAddr,
     target: String,
@@ -469,6 +606,7 @@ async fn create_udp_session(
     global_stop_rx: watch::Receiver<bool>,
 ) -> AppResult<UdpSession> {
     let upstream = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    configure_udp_socket(upstream.as_ref())?;
     upstream.connect(&target).await?;
 
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
@@ -540,13 +678,22 @@ async fn pump_udp_responses(
     mut global_stop_rx: watch::Receiver<bool>,
     mut session_stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
-    let mut buffer = vec![0_u8; 65_535];
+    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_SIZE];
 
     loop {
         tokio::select! {
-            result = upstream.recv(&mut buffer) => {
-                let size = result?;
-                listener.send_to(&buffer[..size], client_addr).await?;
+            readiness = upstream.readable() => {
+                readiness?;
+
+                for _ in 0..UDP_DRAIN_BURST {
+                    let size = match upstream.try_recv(&mut buffer) {
+                        Ok(size) => size,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error.into()),
+                    };
+
+                    send_udp_packet_to(listener.as_ref(), &buffer[..size], client_addr).await?;
+                }
             }
             _ = wait_for_shutdown(&mut global_stop_rx) => {
                 break;
@@ -558,6 +705,296 @@ async fn pump_udp_responses(
     }
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn send_udp_packet(socket: &UdpSocket, payload: &[u8]) -> io::Result<()> {
+    loop {
+        match socket.try_send(payload) {
+            Ok(sent) if sent == payload.len() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UDP socket sent a partial datagram",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => socket.writable().await?,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn send_udp_packet_to(
+    socket: &UdpSocket,
+    payload: &[u8],
+    target: std::net::SocketAddr,
+) -> io::Result<()> {
+    loop {
+        match socket.try_send_to(payload, target) {
+            Ok(sent) if sent == payload.len() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UDP socket sent a partial datagram",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => socket.writable().await?,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn send_udp_batch_connected(
+    socket: &UdpSocket,
+    batch: &UdpRecvBatch,
+    packet_indexes: &[usize],
+) -> io::Result<()> {
+    let mut start = 0;
+    while start < packet_indexes.len() {
+        socket.writable().await?;
+        let payloads = packet_indexes[start..]
+            .iter()
+            .map(|index| batch.payload(*index))
+            .collect::<Vec<_>>();
+        match sendmmsg_connected_raw(socket.as_raw_fd(), &payloads) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "sendmmsg returned zero datagrams for a connected UDP socket",
+                ));
+            }
+            Ok(sent) => start += sent,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tune_socket_buffers(
+    fd: libc::c_int,
+    recv_bytes: libc::c_int,
+    send_bytes: libc::c_int,
+) -> io::Result<()> {
+    set_socket_option(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, recv_bytes)?;
+    set_socket_option(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, send_bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tune_socket_buffers(_fd: i32, _recv_bytes: i32, _send_bytes: i32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_socket_option(
+    fd: libc::c_int,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct UdpRecvBatch {
+    payloads: Vec<Vec<u8>>,
+    addresses: Vec<libc::sockaddr_storage>,
+    address_lengths: Vec<libc::socklen_t>,
+    payload_lengths: Vec<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpRecvBatch {
+    fn new(size: usize) -> Self {
+        let payloads = (0..size)
+            .map(|_| vec![0_u8; UDP_PACKET_BUFFER_SIZE])
+            .collect::<Vec<_>>();
+        let addresses = (0..size)
+            .map(|_| unsafe { std::mem::zeroed::<libc::sockaddr_storage>() })
+            .collect::<Vec<_>>();
+        let address_lengths = vec![0; size];
+        let payload_lengths = vec![0; size];
+
+        Self {
+            payloads,
+            addresses,
+            address_lengths,
+            payload_lengths,
+        }
+    }
+
+    fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+        let mut iovecs = (0..self.payloads.len())
+            .map(|_| unsafe { std::mem::zeroed::<libc::iovec>() })
+            .collect::<Vec<_>>();
+        let mut messages = (0..self.payloads.len())
+            .map(|_| unsafe { std::mem::zeroed::<libc::mmsghdr>() })
+            .collect::<Vec<_>>();
+
+        for index in 0..self.payloads.len() {
+            self.addresses[index] = unsafe { std::mem::zeroed() };
+            self.address_lengths[index] = 0;
+            self.payload_lengths[index] = 0;
+            iovecs[index] = libc::iovec {
+                iov_base: self.payloads[index].as_mut_ptr().cast(),
+                iov_len: self.payloads[index].len(),
+            };
+            messages[index] = libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: (&mut self.addresses[index] as *mut libc::sockaddr_storage).cast(),
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                    msg_iov: (&mut iovecs[index] as *mut libc::iovec).cast(),
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            };
+        }
+
+        loop {
+            let result = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    messages.as_mut_ptr(),
+                    messages.len() as u32,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if result >= 0 {
+                let received = result as usize;
+                for (index, message) in messages.iter().enumerate().take(received) {
+                    self.address_lengths[index] = message.msg_hdr.msg_namelen;
+                    self.payload_lengths[index] = message.msg_len as usize;
+                }
+                return Ok(received);
+            }
+
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(0),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    fn payload(&self, index: usize) -> &[u8] {
+        &self.payloads[index][..self.payload_lengths[index]]
+    }
+
+    fn client_addr(&self, index: usize) -> io::Result<std::net::SocketAddr> {
+        socket_addr_from_storage(&self.addresses[index], self.address_lengths[index])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sendmmsg_connected_raw(fd: RawFd, payloads: &[&[u8]]) -> io::Result<usize> {
+    let mut iovecs = payloads
+        .iter()
+        .map(|payload| libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        })
+        .collect::<Vec<_>>();
+    let mut messages = iovecs
+        .iter_mut()
+        .map(|iov| libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: (iov as *mut libc::iovec).cast(),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        })
+        .collect::<Vec<_>>();
+
+    loop {
+        let result = unsafe {
+            libc::sendmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                messages.len() as u32,
+                libc::MSG_DONTWAIT,
+            )
+        };
+
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+
+        return Err(error);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addr_from_storage(
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+) -> io::Result<std::net::SocketAddr> {
+    if name_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing UDP peer address from recvmmsg",
+        ));
+    }
+
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let addr =
+                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let addr =
+                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+            Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                u16::from_be(addr.sin6_port),
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        family => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported UDP socket family: {}", family),
+        )),
+    }
 }
 
 async fn wait_for_shutdown(stop_rx: &mut watch::Receiver<bool>) {

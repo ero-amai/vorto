@@ -11,7 +11,11 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
     loop {
         render_dashboard(path, &config, dirty);
 
-        match prompt("Action [a/e/t/d/s/q]")?.trim().to_ascii_lowercase().as_str() {
+        match prompt("Action [a/e/t/d/s/q]")?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "a" | "add" => dirty |= add_tunnel(&mut config)?,
             "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
             "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
@@ -42,19 +46,22 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     println!(
         "Tunnels: {} total, {} enabled, {} disabled{}",
         config.tunnels.len(),
-        config.tunnels.iter().filter(|tunnel| tunnel.enabled).count(),
-        config.tunnels.iter().filter(|tunnel| !tunnel.enabled).count(),
+        config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.enabled)
+            .count(),
+        config
+            .tunnels
+            .iter()
+            .filter(|tunnel| !tunnel.enabled)
+            .count(),
         if dirty { " | unsaved changes" } else { "" }
     );
     println!();
     println!(
         "{:<4} {:<18} {:<8} {:<12} {:<10} {:<24} Local listen",
-        "No.",
-        "Name",
-        "Proto",
-        "TCP mode",
-        "State",
-        "Remote target",
+        "No.", "Name", "Proto", "TCP mode", "State", "Remote target",
     );
     println!("{}", "-".repeat(101));
 
@@ -68,7 +75,11 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
                 truncate(&tunnel.name, 18),
                 tunnel.protocol.label(),
                 truncate(tcp_mode_display(tunnel), 12),
-                if tunnel.enabled { "enabled" } else { "disabled" },
+                if tunnel.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
                 truncate(&tunnel.target, 24),
                 tunnel.listen
             );
@@ -168,7 +179,11 @@ fn toggle_tunnel(config: &mut AppConfig) -> AppResult<bool> {
     println!(
         "Tunnel '{}' is now {}.",
         tunnel.name,
-        if tunnel.enabled { "enabled" } else { "disabled" }
+        if tunnel.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     Ok(true)
 }
@@ -361,7 +376,11 @@ fn print_tunnel_details(tunnel: &TunnelConfig) {
     println!("  Local listen : {}", tunnel.listen);
     println!(
         "  State        : {}",
-        if tunnel.enabled { "enabled" } else { "disabled" }
+        if tunnel.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 }
 
@@ -369,7 +388,10 @@ fn truncate(value: &str, width: usize) -> String {
     let mut chars = value.chars();
     let shortened = chars.by_ref().take(width).collect::<String>();
     if chars.next().is_some() && width > 3 {
-        format!("{}...", shortened.chars().take(width - 3).collect::<String>())
+        format!(
+            "{}...",
+            shortened.chars().take(width - 3).collect::<String>()
+        )
     } else {
         shortened
     }
