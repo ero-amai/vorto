@@ -143,7 +143,10 @@ impl AppConfig {
     pub fn save(&self, path: &Path) -> AppResult<()> {
         self.validate()?;
         let rendered = serde_yaml::to_string(self)?;
-        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.yaml");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.yaml");
         let temp_path = path.with_file_name(format!(".{}.tmp.{}", file_name, process::id()));
         fs::write(&temp_path, rendered)?;
         fs::rename(&temp_path, path)?;
@@ -177,22 +180,30 @@ impl AppConfig {
 impl TunnelConfig {
     pub fn validate(&self) -> AppResult<()> {
         if self.name.trim().is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Tunnel name cannot be empty.").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Tunnel name cannot be empty.",
+            )
+            .into());
         }
 
-        self.listen.parse::<std::net::SocketAddr>().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid listen address {}: {}", self.listen, error),
-            )
-        })?;
+        self.listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid listen address {}: {}", self.listen, error),
+                )
+            })?;
 
-        self.target.parse::<std::net::SocketAddr>().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid target address {}: {}", self.target, error),
-            )
-        })?;
+        self.target
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid target address {}: {}", self.target, error),
+                )
+            })?;
 
         Ok(())
     }
