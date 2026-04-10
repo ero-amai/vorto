@@ -129,7 +129,9 @@ tunnels:
 
 - `auto`：当前默认值。现阶段会落到 `throughput`
 - `throughput`：为大块 TCP 吞吐优化。Linux 下会走 `splice` 路径
-- `latency`：更适合交互流量和大量小 TCP 包。该模式会开启 `TCP_NODELAY`，并改走普通 copy 转发路径
+- `latency`：更适合交互流量和大量小 TCP 包。该模式会改走普通 copy 转发路径，并在 Linux 上应用额外的低延迟 socket 调优
+
+所有 TCP tunnel 都会开启 `TCP_NODELAY`，避免 Nagle 缓冲带来的起步延迟。
 
 对于纯 UDP tunnel，`tcp_mode` 会被忽略。
 

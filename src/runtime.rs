@@ -283,9 +283,8 @@ fn configure_tcp_streams(
     outbound: &TcpStream,
     tcp_mode: TcpMode,
 ) -> io::Result<()> {
-    let nodelay = matches!(tcp_mode.effective(), TcpMode::Latency);
-    inbound.set_nodelay(nodelay)?;
-    outbound.set_nodelay(nodelay)?;
+    inbound.set_nodelay(true)?;
+    outbound.set_nodelay(true)?;
     #[cfg(unix)]
     {
         tune_socket_buffers(
@@ -300,7 +299,7 @@ fn configure_tcp_streams(
         )?;
     }
     #[cfg(target_os = "linux")]
-    if nodelay {
+    if matches!(tcp_mode.effective(), TcpMode::Latency) {
         set_socket_option(
             inbound.as_raw_fd(),
             libc::IPPROTO_TCP,
