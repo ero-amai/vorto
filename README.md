@@ -1,5 +1,10 @@
 # vorto
 
+[![github ci](https://github.com/ero-amai/vorto/actions/workflows/release.yml/badge.svg)](https://github.com/ero-amai/vorto/actions/workflows/release.yml)
+[![protocol](https://img.shields.io/badge/protocol-TCP%20%7C%20UDP-success?style=flat-square)](./README.md#features)
+[![mode](https://img.shields.io/badge/mode-foreground%20%7C%20daemon-1f6feb?style=flat-square)](./README.md#quick-start)
+[![config](https://img.shields.io/badge/config-hot--reload-informational?style=flat-square)](./README.md#features)
+
 [简体中文](./README.zh-CN.md)
 
 `vorto` is a lightweight Rust port forwarder for TCP and UDP tunnels.
@@ -66,6 +71,12 @@ Check daemon status:
 
 ```bash
 ./vorto status
+```
+
+Show embedded release metadata:
+
+```bash
+./vorto version
 ```
 
 Stop the daemon:
@@ -165,7 +176,7 @@ Action [a/e/t/d/s/q]:
 
 - TCP forwarding works on all supported Tokio platforms
 - Linux gets the best large-transfer TCP performance because the throughput path uses `splice`
-- UDP forwarding is implemented in user space
+- UDP forwarding is implemented in user space (Linux batch I/O optimization via recvmmsg/sendmmsg)
 
 ## Development
 
