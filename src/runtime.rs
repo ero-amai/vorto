@@ -1,6 +1,8 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::io;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::Once;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +37,8 @@ const UDP_RECV_BATCH_SIZE: usize = 32;
 const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
 #[cfg(target_os = "linux")]
 const SPLICE_PIPE_SIZE: libc::c_int = 1_048_576;
+#[cfg(target_os = "linux")]
+static PIPE_SIZE_WARNING: Once = Once::new();
 
 #[derive(Default)]
 pub struct TunnelManager {
@@ -491,10 +495,52 @@ impl SplicePipe {
 
         let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let _ = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, SPLICE_PIPE_SIZE) };
+        tune_splice_pipe_size(write.as_raw_fd());
 
         Ok(Self { read, write })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_splice_pipe_size(fd: RawFd) {
+    let requested = SPLICE_PIPE_SIZE;
+    let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, requested) };
+    if result >= 0 {
+        let actual = result as libc::c_int;
+        if actual < requested {
+            warn_pipe_size_degraded(Some(actual), None);
+        }
+        return;
+    }
+
+    let error = io::Error::last_os_error();
+    let actual = pipe_size(fd);
+    warn_pipe_size_degraded(actual, Some(error));
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_size(fd: RawFd) -> Option<libc::c_int> {
+    let result = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+    (result >= 0).then_some(result as libc::c_int)
+}
+
+#[cfg(target_os = "linux")]
+fn warn_pipe_size_degraded(actual: Option<libc::c_int>, error: Option<io::Error>) {
+    PIPE_SIZE_WARNING.call_once(|| match (actual, error) {
+        (Some(actual), Some(error)) => eprintln!(
+            "Warning: failed to raise splice pipe size to {} bytes (current: {} bytes): {}",
+            SPLICE_PIPE_SIZE, actual, error
+        ),
+        (None, Some(error)) => eprintln!(
+            "Warning: failed to raise splice pipe size to {} bytes: {}",
+            SPLICE_PIPE_SIZE, error
+        ),
+        (Some(actual), None) => eprintln!(
+            "Warning: splice pipe size is {} bytes, below requested {} bytes.",
+            actual, SPLICE_PIPE_SIZE
+        ),
+        (None, None) => {}
+    });
 }
 
 async fn run_udp_tunnel(
