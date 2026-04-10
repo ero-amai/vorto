@@ -1,0 +1,209 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.meta.outputs.release_version }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      build_timestamp: ${{ steps.meta.outputs.build_timestamp }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+      commit_range: ${{ steps.meta.outputs.commit_range }}
+      log_range: ${{ steps.meta.outputs.log_range }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_date="$(date -u +'%Y.%m.%d')"
+          release_version="${release_date}.${GITHUB_RUN_NUMBER}"
+          tag_name="v${release_version}"
+          build_timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git_sha="$(git rev-parse --short=12 HEAD)"
+          previous_tag="$(git tag --list 'v*' --sort=-version:refname | head -n 1 || true)"
+
+          if [[ -n "${previous_tag}" ]]; then
+            previous_sha="$(git rev-parse --short=12 "${previous_tag}^0")"
+            commit_range="${previous_sha}..${git_sha}"
+            log_range="${previous_tag}..HEAD"
+          else
+            first_sha="$(git rev-list --max-parents=0 HEAD | tail -n 1)"
+            first_short_sha="$(git rev-parse --short=12 "${first_sha}")"
+            commit_range="${first_short_sha}..${git_sha}"
+            log_range="HEAD"
+          fi
+
+          {
+            echo "release_version=${release_version}"
+            echo "tag_name=${tag_name}"
+            echo "build_timestamp=${build_timestamp}"
+            echo "git_sha=${git_sha}"
+            echo "commit_range=${commit_range}"
+            echo "log_range=${log_range}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          {
+            echo "# vorto ${{ steps.meta.outputs.release_version }}"
+            echo
+            echo "- Repository: https://github.com/ero-amai/vorto"
+            echo "- Version: ${{ steps.meta.outputs.release_version }}"
+            echo "- Commit: ${{ steps.meta.outputs.git_sha }}"
+            echo "- Commit range: ${{ steps.meta.outputs.commit_range }}"
+            echo "- Source: https://github.com/ero-amai/vorto"
+            echo
+            echo "## Included commits"
+            git log "${{ steps.meta.outputs.log_range }}" --reverse --pretty=format:'- `%h` %s'
+            echo
+          } > dist/release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: dist/release-notes.md
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: vorto
+            archive_ext: tar.gz
+            asset_name: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: vorto
+            archive_ext: tar.gz
+            asset_name: linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: vorto.exe
+            archive_ext: zip
+            asset_name: windows-amd64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: vorto.exe
+            archive_ext: zip
+            asset_name: windows-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: vorto
+            archive_ext: tar.gz
+            asset_name: macos-amd64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: vorto
+            archive_ext: tar.gz
+            asset_name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      VORTO_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+      VORTO_GIT_SHA: ${{ needs.prepare.outputs.git_sha }}
+      VORTO_COMMIT_RANGE: ${{ needs.prepare.outputs.commit_range }}
+      VORTO_BUILD_TIMESTAMP: ${{ needs.prepare.outputs.build_timestamp }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          package_dir="dist/vorto-${{ needs.prepare.outputs.release_version }}-${{ matrix.asset_name }}"
+          mkdir -p "${package_dir}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${package_dir}/"
+          cp README.md README.zh-CN.md LICENSE "${package_dir}/"
+          tar -C dist -czf "${package_dir}.tar.gz" "$(basename "${package_dir}")"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $packageDir = "dist/vorto-${{ needs.prepare.outputs.release_version }}-${{ matrix.asset_name }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $packageDir
+          Copy-Item README.md, README.zh-CN.md, LICENSE $packageDir
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "$packageDir.zip" -Force
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.asset_name }}
+          path: dist/*.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_name="${{ needs.prepare.outputs.tag_name }}"
+          release_title="vorto ${{ needs.prepare.outputs.release_version }}"
+          notes_file="release-notes/release-notes.md"
+
+          if gh release view "${tag_name}" >/dev/null 2>&1; then
+            gh release edit "${tag_name}" --title "${release_title}" --notes-file "${notes_file}"
+            gh release upload "${tag_name}" artifacts/* --clobber
+          else
+            gh release create "${tag_name}" artifacts/* --title "${release_title}" --notes-file "${notes_file}"
+          fi
