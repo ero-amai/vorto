@@ -9,7 +9,7 @@ use tokio::io::Interest;
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval};
 
 #[cfg(target_os = "linux")]
@@ -212,6 +212,8 @@ async fn run_tcp_tunnel(
     listener: TcpListener,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
+    let mut connections = JoinSet::new();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -219,15 +221,26 @@ async fn run_tcp_tunnel(
                 let target = spec.target.clone();
                 let tcp_mode = spec.tcp_mode;
                 let connection_stop = stop_rx.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
                         eprintln!("TCP connection handling failed: {}", error);
                     }
                 });
             }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    eprintln!("TCP connection task failed: {}", error);
+                }
+            }
             _ = wait_for_shutdown(&mut stop_rx) => {
                 break;
             }
+        }
+    }
+
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            eprintln!("TCP connection task failed during shutdown: {}", error);
         }
     }
 

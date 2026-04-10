@@ -90,6 +90,8 @@ Stop the daemon:
 Example `config.yaml`:
 
 ```yaml
+daemon_log: true
+
 tunnels:
   - name: web
     enabled: true
@@ -115,6 +117,7 @@ tunnels:
 
 ### Tunnel Fields
 
+- `daemon_log`: Whether daemon mode writes stdout/stderr to `./vorto.log`
 - `name`: Unique tunnel name
 - `enabled`: Whether the tunnel should run
 - `protocol`: `tcp`, `udp`, or `both`
@@ -146,6 +149,8 @@ For UDP-only tunnels, `tcp_mode` is ignored.
 - Starts newly added tunnels
 - Restarts only tunnels whose config changed
 - Keeps unchanged tunnels running without unnecessary interruption
+- Writes daemon stdout/stderr to `./vorto.log` when `daemon_log: true`
+- Discards daemon stdout/stderr when `daemon_log: false`
 
 If a config reload fails, the daemon keeps the currently running tunnels unchanged and retries on the next poll.
 
@@ -163,6 +168,7 @@ The editor lets you:
 - Edit tunnels
 - Enable or disable tunnels
 - Delete tunnels
+- Toggle daemon log file output
 - Save changes back to `config.yaml`
 
 Input is displayed on a new line for better readability:

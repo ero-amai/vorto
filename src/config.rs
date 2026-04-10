@@ -10,6 +10,8 @@ use crate::AppResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AppConfig {
+    #[serde(default = "default_daemon_log")]
+    pub daemon_log: bool,
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 }
@@ -44,6 +46,10 @@ pub enum TcpMode {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_daemon_log() -> bool {
     true
 }
 
@@ -257,6 +263,7 @@ mod tests {
     fn save_writes_a_runtime_loadable_config() {
         let path = temp_path("save");
         let config = AppConfig {
+            daemon_log: true,
             tunnels: vec![TunnelConfig {
                 name: "alpha".to_string(),
                 listen: "127.0.0.1:18080".to_string(),
@@ -281,6 +288,7 @@ mod tests {
         )
         .expect("older config should still parse");
 
+        assert!(config.daemon_log);
         assert_eq!(config.tunnels.len(), 1);
         assert_eq!(config.tunnels[0].tcp_mode, TcpMode::Auto);
     }
@@ -289,5 +297,12 @@ mod tests {
     fn tcp_mode_auto_defaults_to_throughput_at_runtime() {
         assert_eq!(TcpMode::Auto.effective(), TcpMode::Throughput);
         assert_eq!(TcpMode::Latency.effective(), TcpMode::Latency);
+    }
+
+    #[test]
+    fn parse_accepts_disabling_daemon_log() {
+        let config = AppConfig::parse("daemon_log: false\ntunnels: []\n")
+            .expect("daemon_log=false should parse");
+        assert!(!config.daemon_log);
     }
 }
