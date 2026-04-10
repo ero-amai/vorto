@@ -17,6 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use config::AppConfig;
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type ProcessId = u32;
 
 const CONFIG_FILE: &str = "config.yaml";
 const PID_FILE: &str = "vorto.pid";
@@ -157,22 +158,17 @@ fn print_help() {
     println!("  ./vorto help     Show this help message");
 }
 
-fn read_pid(path: &Path) -> AppResult<Option<i32>> {
+fn read_pid(path: &Path) -> AppResult<Option<ProcessId>> {
     if !path.exists() {
         return Ok(None);
     }
 
     let content = fs::read_to_string(path)?;
-    let pid = content.trim().parse::<i32>().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid PID file contents: {}", error),
-        )
-    })?;
+    let pid = parse_pid(&content)?;
     Ok(Some(pid))
 }
 
-fn daemon_process_matches(pid: i32) -> AppResult<bool> {
+fn daemon_process_matches(pid: ProcessId) -> AppResult<bool> {
     #[cfg(unix)]
     {
         let proc_dir = PathBuf::from(format!("/proc/{}", pid));
@@ -192,13 +188,16 @@ fn daemon_process_matches(pid: i32) -> AppResult<bool> {
     }
 }
 
-fn terminate_process(pid: i32) -> AppResult<()> {
+fn terminate_process(pid: ProcessId) -> AppResult<()> {
     #[cfg(unix)]
-    unsafe {
-        if libc::kill(pid, libc::SIGTERM) != 0 {
-            return Err(io::Error::last_os_error().into());
+    {
+        let pid = platform_pid(pid)?;
+        unsafe {
+            if libc::kill(pid, libc::SIGTERM) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -206,6 +205,27 @@ fn terminate_process(pid: i32) -> AppResult<()> {
         let _ = pid;
         Err(io::Error::other("The stop command is not supported on this platform.").into())
     }
+}
+
+fn parse_pid(content: &str) -> AppResult<ProcessId> {
+    content.trim().parse::<ProcessId>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid PID file contents: {}", error),
+        )
+        .into()
+    })
+}
+
+#[cfg(unix)]
+fn platform_pid(pid: ProcessId) -> AppResult<libc::pid_t> {
+    i32::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("PID {} is too large for platform APIs.", pid),
+        )
+        .into()
+    })
 }
 
 struct PidFileGuard {
@@ -258,7 +278,8 @@ fn daemon_program_name(program: &[u8], binary_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::is_daemon_worker_cmdline;
+    use super::{is_daemon_worker_cmdline, platform_pid};
+    use super::parse_pid;
 
     #[cfg(unix)]
     #[test]
@@ -281,5 +302,17 @@ mod tests {
             "vorto"
         ));
         assert!(!is_daemon_worker_cmdline(b"/tmp/vorto\0run\0", "vorto"));
+    }
+
+    #[test]
+    fn parse_pid_accepts_unsigned_process_ids() {
+        assert_eq!(parse_pid("12345\n").expect("pid should parse"), 12_345);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_pid_rejects_values_outside_pid_t_range() {
+        let error = platform_pid(u32::MAX).expect_err("oversized pid should fail");
+        assert!(error.to_string().contains("too large"));
     }
 }
