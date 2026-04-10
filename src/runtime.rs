@@ -227,7 +227,7 @@ async fn run_tcp_tunnel(
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
-                        eprintln!("TCP connection handling failed: {}", error);
+                        log_tcp_connection_error(error.as_ref());
                     }
                 });
             }
@@ -249,6 +249,22 @@ async fn run_tcp_tunnel(
     }
 
     Ok(())
+}
+
+fn log_tcp_connection_error(error: &dyn std::error::Error) {
+    if is_expected_tcp_disconnect_message(&error.to_string()) {
+        return;
+    }
+
+    eprintln!("TCP connection handling failed: {}", error);
+}
+
+fn is_expected_tcp_disconnect_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("broken pipe")
+        || message.contains("connection reset")
+        || message.contains("connection aborted")
+        || message.contains("unexpected eof")
 }
 
 async fn handle_tcp_connection(
