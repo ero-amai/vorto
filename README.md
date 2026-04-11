@@ -1,5 +1,8 @@
 # vorto
 
+> [!IMPORTANT]
+> This project is still in an early stage and requires more testing and further feature improvements.
+
 [![github ci](https://github.com/ero-amai/vorto/actions/workflows/release.yml/badge.svg)](https://github.com/ero-amai/vorto/actions/workflows/release.yml)
 [![protocol](https://img.shields.io/badge/protocol-TCP%20%7C%20UDP-success?style=flat)](./README.md#features)
 [![mode](https://img.shields.io/badge/mode-foreground%20%7C%20daemon-1f6feb?style=flat)](./README.md#quick-start)
