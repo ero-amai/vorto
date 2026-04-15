@@ -15,7 +15,6 @@
 - 后台守护进程模式，并支持配置热更新
 - 使用 `./vorto config` 进行交互式配置
 - TCP、UDP、双协议转发
-- 按 tunnel 单独选择 TCP 转发策略
 
 配置文件固定保存在当前工作目录下的 `./config.yaml`。
 
@@ -26,7 +25,6 @@
 - 原子化保存配置文件
 - 后台模式按配置差异热更新，不重启未变化的 tunnel
 - Linux 下 TCP 大流量路径使用 `splice`
-- 每个 tunnel 都可以单独配置 `tcp_mode`
 
 ## 构建
 
@@ -98,21 +96,18 @@ tunnels:
   - name: web
     enabled: true
     protocol: tcp
-    tcp_mode: throughput
     target: 203.0.113.10:443
     listen: 0.0.0.0:8443
 
   - name: dns
     enabled: true
     protocol: udp
-    tcp_mode: auto
     target: 1.1.1.1:53
     listen: 127.0.0.1:5353
 
   - name: game
     enabled: true
     protocol: both
-    tcp_mode: latency
     target: 198.51.100.20:30000
     listen: 0.0.0.0:30000
 ```
@@ -123,17 +118,8 @@ tunnels:
 - `name`：唯一的 tunnel 名称
 - `enabled`：是否启用该 tunnel
 - `protocol`：`tcp`、`udp` 或 `both`
-- `tcp_mode`：`auto`、`throughput` 或 `latency`
 - `target`：远端目标地址，格式为 `host:port`
 - `listen`：本地监听地址，格式为 `host:port`
-
-### `tcp_mode` 说明
-
-- `auto`：当前默认值。现阶段会落到 `throughput`
-- `throughput`：为大块 TCP 吞吐优化。Linux 下会走 `splice` 路径
-- `latency`：更适合交互流量和大量小 TCP 包。该模式会改走普通 copy 转发路径，并在 Linux 上应用额外的低延迟 socket 调优
-
-对于纯 UDP tunnel，`tcp_mode` 会被忽略。
 
 ## 运行时行为
 
@@ -183,7 +169,8 @@ Action [a/e/t/d/s/q]:
 ## 平台说明
 
 - TCP 转发在 Tokio 支持的平台上都能工作
-- Linux 下的大流量 TCP 性能最好，因为吞吐路径使用了 `splice`
+- Linux 下 TCP 会使用专门的 `splice` 路径
+- macOS 和 Windows 当前运行普通 copy 转发路径
 - UDP 转发目前是用户态实现（在 Linux 下有基于 recvmmsg/sendmmsg 的批量收发优化）
 
 ## 开发

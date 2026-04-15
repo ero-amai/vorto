@@ -18,7 +18,7 @@ It supports:
 - Background daemon mode with config hot-reload
 - Interactive tunnel management with `./vorto config`
 - TCP, UDP, or dual-protocol tunnels
-- Per-tunnel TCP forwarding strategy selection
+- TCP and UDP forwarding
 
 Configuration is stored in `./config.yaml` in the current working directory.
 
@@ -29,7 +29,6 @@ Configuration is stored in `./config.yaml` in the current working directory.
 - Atomic config saves
 - Daemon config diffing without restarting unchanged tunnels
 - Linux TCP throughput path using `splice`
-- Per-tunnel `tcp_mode` for throughput-oriented or latency-oriented forwarding
 
 ## Build
 
@@ -101,21 +100,18 @@ tunnels:
   - name: web
     enabled: true
     protocol: tcp
-    tcp_mode: throughput
     target: 203.0.113.10:443
     listen: 0.0.0.0:8443
 
   - name: dns
     enabled: true
     protocol: udp
-    tcp_mode: auto
     target: 1.1.1.1:53
     listen: 127.0.0.1:5353
 
   - name: game
     enabled: true
     protocol: both
-    tcp_mode: latency
     target: 198.51.100.20:30000
     listen: 0.0.0.0:30000
 ```
@@ -126,19 +122,10 @@ tunnels:
 - `name`: Unique tunnel name
 - `enabled`: Whether the tunnel should run
 - `protocol`: `tcp`, `udp`, or `both`
-- `tcp_mode`: `auto`, `throughput`, or `latency`
 - `target`: Remote target address in `host:port` format
 - `listen`: Local listen address in `host:port` format
 
-### `tcp_mode`
-
-- `auto`: Current default. At the moment it resolves to `throughput`.
-- `throughput`: Optimized for large bulk TCP transfers. On Linux this uses the `splice` path.
-- `latency`: Better suited for interactive traffic and many small TCP packets. This mode uses a regular copy-based relay path and applies extra low-latency socket tuning on Linux.
-
 `TCP_NODELAY` is enabled for all TCP tunnels to avoid startup latency from Nagle buffering.
-
-For UDP-only tunnels, `tcp_mode` is ignored.
 
 ## Runtime Behavior
 
@@ -188,7 +175,8 @@ Action [a/e/t/d/s/q]:
 ## Platform Notes
 
 - TCP forwarding works on all supported Tokio platforms
-- Linux gets the best large-transfer TCP performance because the throughput path uses `splice`
+- Linux uses the dedicated `splice` TCP path
+- macOS and Windows run the regular copy-based TCP relay path
 - UDP forwarding is implemented in user space (Linux batch I/O optimization via recvmmsg/sendmmsg)
 
 ## Development

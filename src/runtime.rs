@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
+#[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -22,13 +23,14 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
-use crate::config::{AppConfig, TcpMode, TunnelConfig};
+use crate::config::{AppConfig, TunnelConfig};
 
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
+#[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
 const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
@@ -298,10 +300,9 @@ async fn run_tcp_tunnel(
                     }
                 };
                 let target = spec.target.clone();
-                let tcp_mode = spec.tcp_mode;
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
-                    if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
+                    if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
                         log_tcp_connection_error(error.as_ref());
                     }
                 });
@@ -382,7 +383,6 @@ fn is_expected_tcp_disconnect_message(message: &str) -> bool {
 async fn handle_tcp_connection(
     inbound: TcpStream,
     target: &str,
-    tcp_mode: TcpMode,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let outbound = tokio::select! {
@@ -390,31 +390,20 @@ async fn handle_tcp_connection(
         _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
     };
 
-    configure_tcp_streams(&inbound, &outbound, tcp_mode)?;
+    configure_tcp_streams(&inbound, &outbound)?;
 
     #[cfg(target_os = "linux")]
     {
-        match tcp_mode.effective() {
-            TcpMode::Throughput => handle_tcp_connection_splice(inbound, outbound, stop_rx).await,
-            TcpMode::Latency => handle_tcp_connection_copy(inbound, outbound, stop_rx).await,
-            TcpMode::Auto => {
-                unreachable!("auto mode should resolve before selecting a runtime path")
-            }
-        }
+        handle_tcp_connection_splice(inbound, outbound, stop_rx).await
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = tcp_mode;
         handle_tcp_connection_copy(inbound, outbound, stop_rx).await
     }
 }
 
-fn configure_tcp_streams(
-    inbound: &TcpStream,
-    outbound: &TcpStream,
-    tcp_mode: TcpMode,
-) -> io::Result<()> {
+fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Result<()> {
     inbound.set_nodelay(true)?;
     outbound.set_nodelay(true)?;
     #[cfg(unix)]
@@ -428,21 +417,6 @@ fn configure_tcp_streams(
             outbound.as_raw_fd(),
             TCP_SOCKET_BUFFER_SIZE,
             TCP_SOCKET_BUFFER_SIZE,
-        )?;
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(tcp_mode.effective(), TcpMode::Latency) {
-        set_socket_option(
-            inbound.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_QUICKACK,
-            1,
-        )?;
-        set_socket_option(
-            outbound.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_QUICKACK,
-            1,
         )?;
     }
     Ok(())
@@ -461,6 +435,7 @@ fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn handle_tcp_connection_copy(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
@@ -589,7 +564,9 @@ fn splice_raw(fd_in: RawFd, fd_out: RawFd, length: usize) -> io::Result<usize> {
                 fd_out,
                 std::ptr::null_mut(),
                 length,
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE | libc::SPLICE_F_NONBLOCK,
+                // `SPLICE_F_MORE` can batch tiny writes and add ~100-400ms latency to
+                // request/response traffic, which is unacceptable for tunnel RTT.
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
             )
         };
 
