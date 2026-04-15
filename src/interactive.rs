@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::AppResult;
-use crate::config::{AppConfig, Protocol, TunnelConfig};
+use crate::config::{AppConfig, AppMode, Protocol, TunnelConfig};
 
 pub fn manage_config(path: &Path) -> AppResult<()> {
     let mut config = AppConfig::load_or_default(path)?;
@@ -11,7 +11,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
     loop {
         render_dashboard(path, &config, dirty);
 
-        match prompt("Action [a/e/t/d/l/s/q]")?
+        match prompt("Action [a/e/t/d/m/l/s/q]")?
             .trim()
             .to_ascii_lowercase()
             .as_str()
@@ -20,6 +20,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
             "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
             "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
             "d" | "delete" => dirty |= delete_tunnel(&mut config)?,
+            "m" | "mode" => dirty |= toggle_mode(&mut config),
             "l" | "log" => dirty |= toggle_daemon_log(&mut config),
             "s" | "save" => {
                 config.save(path)?;
@@ -35,7 +36,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
                 return Ok(());
             }
             "" => {}
-            _ => println!("Unknown action. Use a, e, t, d, l, s, or q."),
+            _ => println!("Unknown action. Use a, e, t, d, m, l, s, or q."),
         }
     }
 }
@@ -58,6 +59,13 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
             .filter(|tunnel| !tunnel.enabled)
             .count(),
         if dirty { " | unsaved changes" } else { "" }
+    );
+    println!(
+        "Forwarding mode: {}",
+        match config.mode {
+            AppMode::Socket => "socket listeners",
+            AppMode::Nft => "nftables NAT",
+        }
     );
     println!(
         "Daemon log file: {}",
@@ -100,6 +108,7 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     println!("  e = edit tunnel");
     println!("  t = toggle enabled/disabled");
     println!("  d = delete tunnel");
+    println!("  m = toggle forwarding mode (socket/nft)");
     println!("  l = toggle daemon log file");
     println!("  s = save and exit");
     println!("  q = quit");
@@ -224,6 +233,15 @@ fn toggle_daemon_log(config: &mut AppConfig) -> bool {
             "disabled"
         }
     );
+    true
+}
+
+fn toggle_mode(config: &mut AppConfig) -> bool {
+    config.mode = match config.mode {
+        AppMode::Socket => AppMode::Nft,
+        AppMode::Nft => AppMode::Socket,
+    };
+    println!("Forwarding mode is now {}.", config.mode.label());
     true
 }
 

@@ -23,7 +23,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
-use crate::config::{AppConfig, TunnelConfig};
+use crate::config::{AppConfig, AppMode, TunnelConfig};
+use crate::nft::NftManager;
 
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -206,9 +207,17 @@ impl ActiveTunnel {
 pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
     let config = AppConfig::load_for_runtime(config_path)?;
     let desired_tunnels = config.enabled_tunnels();
-    let mut manager = TunnelManager::default();
-    if !manager.start_from_config(&config).await {
-        manager.stop_all().await;
+    let mut socket_manager = TunnelManager::default();
+    let mut nft_manager = NftManager::new();
+
+    let started = match config.mode {
+        AppMode::Socket => socket_manager.start_from_config(&config).await,
+        AppMode::Nft => nft_manager.reconcile(desired_tunnels.clone()).await,
+    };
+
+    if !started {
+        socket_manager.stop_all().await;
+        nft_manager.stop_all().await;
         return Err(io::Error::other("Failed to start one or more tunnels.").into());
     }
     println!("Foreground mode started. Press Ctrl+C to stop.");
@@ -224,36 +233,67 @@ pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
                 break;
             }
             _ = health_tick.tick() => {
-                if !manager.reconcile(desired_tunnels.clone()).await {
+                if matches!(config.mode, AppMode::Socket)
+                    && !socket_manager.reconcile(desired_tunnels.clone()).await
+                {
                     eprintln!("One or more foreground tunnels failed to restart. Will retry.");
                 }
             }
         }
     }
 
-    manager.stop_all().await;
+    socket_manager.stop_all().await;
+    nft_manager.stop_all().await;
     Ok(())
 }
 
 pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> AppResult<()> {
-    let mut manager = TunnelManager::default();
+    let mut socket_manager = TunnelManager::default();
+    let mut nft_manager = NftManager::new();
     let mut last_applied_config = None::<AppConfig>;
 
     loop {
         match AppConfig::load_for_runtime(config_path) {
             Ok(config) => {
                 let config_changed = last_applied_config.as_ref() != Some(&config);
-                let applied = manager.reconcile(config.enabled_tunnels()).await;
+                let desired_tunnels = config.enabled_tunnels();
+                let applied = match config.mode {
+                    AppMode::Socket => {
+                        let applied = socket_manager.reconcile(desired_tunnels).await;
+                        if applied
+                            && last_applied_config
+                                .as_ref()
+                                .is_some_and(|current| current.mode == AppMode::Nft)
+                        {
+                            nft_manager.stop_all().await;
+                        }
+                        applied
+                    }
+                    AppMode::Nft => {
+                        let applied = nft_manager.reconcile(desired_tunnels).await;
+                        if applied
+                            && last_applied_config
+                                .as_ref()
+                                .is_some_and(|current| current.mode == AppMode::Socket)
+                        {
+                            socket_manager.stop_all().await;
+                        }
+                        applied
+                    }
+                };
                 if applied {
                     last_applied_config = Some(config);
                 } else if config_changed {
                     eprintln!(
-                        "Will retry the current config on the next poll because some tunnels failed to start."
+                        "Will retry the current config on the next poll because some rules or tunnels failed to start."
                     );
                 } else {
-                    eprintln!(
-                        "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
-                    );
+                    match config.mode {
+                        AppMode::Socket => eprintln!(
+                            "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
+                        ),
+                        AppMode::Nft => {}
+                    }
                 }
             }
             Err(error) => {
@@ -273,7 +313,8 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
         }
     }
 
-    manager.stop_all().await;
+    socket_manager.stop_all().await;
+    nft_manager.stop_all().await;
     Ok(())
 }
 

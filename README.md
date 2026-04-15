@@ -18,7 +18,7 @@ It supports:
 - Background daemon mode with config hot-reload
 - Interactive tunnel management with `./vorto config`
 - TCP, UDP, or dual-protocol tunnels
-- TCP and UDP forwarding
+- Top-level forwarding mode selection: `socket` or `nft`
 
 Configuration is stored in `./config.yaml` in the current working directory.
 
@@ -72,8 +72,9 @@ File: /root/vorto/config.yaml
 Tunnels: 0 total, 0 enabled, 0 disabled
 Daemon log file: disabled
 
-No.  Name               Proto    TCP mode     State      Remote target            Local listen
------------------------------------------------------------------------------------------------------
+Forwarding mode: socket listeners
+No.  Name               Proto    State      Remote target            Local listen
+---------------------------------------------------------------------------------------
 (no tunnels configured)
 
 Actions:
@@ -81,11 +82,12 @@ Actions:
   e = edit tunnel
   t = toggle enabled/disabled
   d = delete tunnel
+  m = toggle forwarding mode (socket/nft)
   l = toggle daemon log file
   s = save and exit
   q = quit
 
-Action [a/e/t/d/l/s/q]:
+Action [a/e/t/d/m/l/s/q]:
 └─ 
 ```
 
@@ -95,6 +97,7 @@ Example `config.yaml`:
 
 ```yaml
 daemon_log: true
+mode: socket
 
 tunnels:
   - name: web
@@ -119,6 +122,7 @@ tunnels:
 ### Tunnel Fields
 
 - `daemon_log`: Whether daemon mode writes stdout/stderr to `./vorto.log`
+- `mode`: Forwarding backend. `socket` is the default. `nft` is Linux-only.
 - `name`: Unique tunnel name
 - `enabled`: Whether the tunnel should run
 - `protocol`: `tcp`, `udp`, or `both`
@@ -127,12 +131,24 @@ tunnels:
 
 `TCP_NODELAY` is enabled for all TCP tunnels to avoid startup latency from Nagle buffering.
 
+### `mode`
+
+- `socket`: Default mode. `vorto` opens listeners in user space and relays traffic itself.
+- `nft`: Linux-only mode. `vorto` creates a dedicated nftables NAT table while the process is running and deletes it on shutdown.
+
+`nft` mode requirements:
+
+- Linux with the `nft` command available
+- Sufficient privileges to modify nftables
+- Each enabled tunnel must use an explicit IPv4 listen address
+- `target` must also be IPv4
+
 ## Runtime Behavior
 
 ### Foreground mode
 
 - Reads `config.yaml` once at startup
-- Starts all enabled tunnels
+- Starts all enabled tunnels or applies the nftables ruleset for them
 - Does not watch for later config changes
 
 ### Daemon mode
@@ -141,7 +157,8 @@ tunnels:
 - Applies config diffs by tunnel name
 - Removes deleted tunnels
 - Starts newly added tunnels
-- Restarts only tunnels whose config changed
+- Restarts only tunnels whose config changed in `socket` mode
+- Rebuilds the nftables ruleset when config changes in `nft` mode
 - Keeps unchanged tunnels running without unnecessary interruption
 - Writes daemon stdout/stderr to `./vorto.log` when `daemon_log: true`
 - Discards daemon stdout/stderr when `daemon_log: false`
@@ -162,13 +179,14 @@ The editor lets you:
 - Edit tunnels
 - Enable or disable tunnels
 - Delete tunnels
+- Toggle forwarding mode between `socket` and `nft`
 - Toggle daemon log file output
 - Save changes back to `config.yaml`
 
 Input is displayed on a new line for better readability:
 
 ```text
-Action [a/e/t/d/s/q]:
+Action [a/e/t/d/m/l/s/q]:
 └─ 
 ```
 
@@ -177,6 +195,7 @@ Action [a/e/t/d/s/q]:
 - TCP forwarding works on all supported Tokio platforms
 - Linux uses the dedicated `splice` TCP path
 - macOS and Windows run the regular copy-based TCP relay path
+- `nft` mode is only available on Linux
 - UDP forwarding is implemented in user space (Linux batch I/O optimization via recvmmsg/sendmmsg)
 
 ## Development

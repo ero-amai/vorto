@@ -1,5 +1,6 @@
 mod config;
 mod interactive;
+mod nft;
 mod runtime;
 mod version;
 

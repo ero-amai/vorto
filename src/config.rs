@@ -13,6 +13,8 @@ pub struct AppConfig {
     #[serde(default = "default_daemon_log")]
     pub daemon_log: bool,
     #[serde(default)]
+    pub mode: AppMode,
+    #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 }
 
@@ -32,6 +34,14 @@ pub enum Protocol {
     Tcp,
     Udp,
     Both,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AppMode {
+    #[default]
+    Socket,
+    Nft,
 }
 
 fn default_enabled() -> bool {
@@ -68,6 +78,15 @@ impl Protocol {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
             Self::Both => "both",
+        }
+    }
+}
+
+impl AppMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Socket => "socket",
+            Self::Nft => "nft",
         }
     }
 }
@@ -146,6 +165,107 @@ impl AppConfig {
                 .into());
             }
         }
+
+        if self.mode == AppMode::Nft {
+            self.validate_nft_mode()?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_nft_mode(&self) -> AppResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "nft mode is only supported on Linux.",
+            )
+            .into());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut tcp_listens = HashSet::new();
+            let mut udp_listens = HashSet::new();
+
+            for tunnel in self.enabled_tunnels() {
+                let listen = tunnel
+                    .listen
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid listen address {}: {}", tunnel.listen, error),
+                        )
+                    })?;
+                let target = tunnel
+                    .target
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid target address {}: {}", tunnel.target, error),
+                        )
+                    })?;
+
+                let std::net::SocketAddr::V4(listen_v4) = listen else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "nft mode only supports IPv4 listen addresses: {}",
+                            tunnel.listen
+                        ),
+                    )
+                    .into());
+                };
+                let std::net::SocketAddr::V4(target_v4) = target else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "nft mode only supports IPv4 target addresses: {}",
+                            tunnel.target
+                        ),
+                    )
+                    .into());
+                };
+
+                if listen_v4.ip().is_unspecified() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "nft mode requires a specific IPv4 listen address, not {}",
+                            tunnel.listen
+                        ),
+                    )
+                    .into());
+                }
+
+                let _ = target_v4;
+
+                let listen_key = (listen_v4.ip().to_string(), listen_v4.port());
+                if tunnel.protocol.supports_tcp() && !tcp_listens.insert(listen_key.clone()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Duplicate TCP listen endpoint in nft mode: {}",
+                            tunnel.listen
+                        ),
+                    )
+                    .into());
+                }
+                if tunnel.protocol.supports_udp() && !udp_listens.insert(listen_key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Duplicate UDP listen endpoint in nft mode: {}",
+                            tunnel.listen
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -231,6 +351,7 @@ mod tests {
         let path = temp_path("save");
         let config = AppConfig {
             daemon_log: true,
+            mode: AppMode::Socket,
             tunnels: vec![TunnelConfig {
                 name: "alpha".to_string(),
                 listen: "127.0.0.1:18080".to_string(),
@@ -252,5 +373,35 @@ mod tests {
         let config = AppConfig::parse("daemon_log: false\ntunnels: []\n")
             .expect("daemon_log=false should parse");
         assert!(!config.daemon_log);
+    }
+
+    #[test]
+    fn parse_defaults_mode_to_socket() {
+        let config = AppConfig::parse("tunnels: []\n").expect("default mode should parse");
+        assert_eq!(config.mode, AppMode::Socket);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_accepts_nft_mode_with_explicit_ipv4_endpoints() {
+        let config = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: nft\n    listen: 127.0.0.1:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+        )
+        .expect("nft mode config should parse on linux");
+        assert_eq!(config.mode, AppMode::Nft);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_mode_rejects_unspecified_listen_address() {
+        let error = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: nft\n    listen: 0.0.0.0:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+        )
+        .expect_err("nft mode should reject unspecified listen addresses");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a specific IPv4 listen address")
+        );
     }
 }
