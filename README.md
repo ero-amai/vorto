@@ -52,40 +52,42 @@ The compiled binary will be available at:
 
 ## Quick Start
 
-Create or edit tunnels interactively:
-
 ```bash
-./vorto config
+~$ ./vorto 
+
+Usage:
+  ./vorto config   Interactively manage tunnels in ./config.yaml
+  ./vorto run      Run in the foreground (./config.yaml)
+  ./vorto daemon   Run in the background (hot-reload ./config.yaml changes)
+  ./vorto stop     Stop the background process
+  ./vorto status   Show background process status
+  ./vorto version  Show release, commit, and repository information
+  ./vorto help     Show this help message
 ```
 
-Run in the foreground:
-
 ```bash
-./vorto run
-```
+~$ ./vorto config
 
-Run as a background daemon:
+Config editor
+File: /root/vorto/config.yaml
+Tunnels: 0 total, 0 enabled, 0 disabled
+Daemon log file: disabled
 
-```bash
-./vorto daemon
-```
+No.  Name               Proto    TCP mode     State      Remote target            Local listen
+-----------------------------------------------------------------------------------------------------
+(no tunnels configured)
 
-Check daemon status:
+Actions:
+  a = add tunnel
+  e = edit tunnel
+  t = toggle enabled/disabled
+  d = delete tunnel
+  l = toggle daemon log file
+  s = save and exit
+  q = quit
 
-```bash
-./vorto status
-```
-
-Show embedded release metadata:
-
-```bash
-./vorto version
-```
-
-Stop the daemon:
-
-```bash
-./vorto stop
+Action [a/e/t/d/l/s/q]:
+└─ 
 ```
 
 ## Configuration

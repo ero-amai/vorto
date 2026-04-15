@@ -49,40 +49,42 @@ cargo build --release
 
 ## 快速开始
 
-交互式创建或编辑 tunnel：
-
 ```bash
-./vorto config
+~$ ./vorto 
+
+Usage:
+  ./vorto config   Interactively manage tunnels in ./config.yaml
+  ./vorto run      Run in the foreground (./config.yaml)
+  ./vorto daemon   Run in the background (hot-reload ./config.yaml changes)
+  ./vorto stop     Stop the background process
+  ./vorto status   Show background process status
+  ./vorto version  Show release, commit, and repository information
+  ./vorto help     Show this help message
 ```
 
-前台运行：
-
 ```bash
-./vorto run
-```
+~$ ./vorto config
 
-后台守护运行：
+Config editor
+File: /root/vorto/config.yaml
+Tunnels: 0 total, 0 enabled, 0 disabled
+Daemon log file: disabled
 
-```bash
-./vorto daemon
-```
+No.  Name               Proto    TCP mode     State      Remote target            Local listen
+-----------------------------------------------------------------------------------------------------
+(no tunnels configured)
 
-查看后台状态：
+Actions:
+  a = add tunnel
+  e = edit tunnel
+  t = toggle enabled/disabled
+  d = delete tunnel
+  l = toggle daemon log file
+  s = save and exit
+  q = quit
 
-```bash
-./vorto status
-```
-
-查看内嵌版本信息：
-
-```bash
-./vorto version
-```
-
-停止后台进程：
-
-```bash
-./vorto stop
+Action [a/e/t/d/l/s/q]:
+└─ 
 ```
 
 ## 配置文件
@@ -130,8 +132,6 @@ tunnels:
 - `auto`：当前默认值。现阶段会落到 `throughput`
 - `throughput`：为大块 TCP 吞吐优化。Linux 下会走 `splice` 路径
 - `latency`：更适合交互流量和大量小 TCP 包。该模式会改走普通 copy 转发路径，并在 Linux 上应用额外的低延迟 socket 调优
-
-所有 TCP tunnel 都会开启 `TCP_NODELAY`，避免 Nagle 缓冲带来的起步延迟。
 
 对于纯 UDP tunnel，`tcp_mode` 会被忽略。
 
