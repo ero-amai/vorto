@@ -335,18 +335,12 @@ pub(super) fn reserve_udp_addr() -> SocketAddr {
     addr
 }
 
-pub(super) fn tcp_tunnel_spec(
-    name: &str,
-    listen: SocketAddr,
-    target: SocketAddr,
-    tcp_mode: TcpMode,
-) -> TunnelConfig {
+pub(super) fn tcp_tunnel_spec(name: &str, listen: SocketAddr, target: SocketAddr) -> TunnelConfig {
     TunnelConfig {
         name: name.to_string(),
         listen: listen.to_string(),
         target: target.to_string(),
         protocol: Protocol::Tcp,
-        tcp_mode,
         enabled: true,
     }
 }
@@ -357,7 +351,6 @@ pub(super) fn udp_tunnel_spec(name: &str, listen: SocketAddr, target: SocketAddr
         listen: listen.to_string(),
         target: target.to_string(),
         protocol: Protocol::Udp,
-        tcp_mode: TcpMode::Auto,
         enabled: true,
     }
 }

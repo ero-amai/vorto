@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
+#[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -22,13 +23,15 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
-use crate::config::{AppConfig, TcpMode, TunnelConfig};
+use crate::config::{AppConfig, AppMode, TunnelConfig};
+use crate::nft::NftManager;
 
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
+#[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
 const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
@@ -204,9 +207,17 @@ impl ActiveTunnel {
 pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
     let config = AppConfig::load_for_runtime(config_path)?;
     let desired_tunnels = config.enabled_tunnels();
-    let mut manager = TunnelManager::default();
-    if !manager.start_from_config(&config).await {
-        manager.stop_all().await;
+    let mut socket_manager = TunnelManager::default();
+    let mut nft_manager = NftManager::new();
+
+    let started = match config.mode {
+        AppMode::Socket => socket_manager.start_from_config(&config).await,
+        AppMode::Nft => nft_manager.reconcile(desired_tunnels.clone()).await,
+    };
+
+    if !started {
+        socket_manager.stop_all().await;
+        nft_manager.stop_all().await;
         return Err(io::Error::other("Failed to start one or more tunnels.").into());
     }
     println!("Foreground mode started. Press Ctrl+C to stop.");
@@ -222,36 +233,67 @@ pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
                 break;
             }
             _ = health_tick.tick() => {
-                if !manager.reconcile(desired_tunnels.clone()).await {
+                if matches!(config.mode, AppMode::Socket)
+                    && !socket_manager.reconcile(desired_tunnels.clone()).await
+                {
                     eprintln!("One or more foreground tunnels failed to restart. Will retry.");
                 }
             }
         }
     }
 
-    manager.stop_all().await;
+    socket_manager.stop_all().await;
+    nft_manager.stop_all().await;
     Ok(())
 }
 
 pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> AppResult<()> {
-    let mut manager = TunnelManager::default();
+    let mut socket_manager = TunnelManager::default();
+    let mut nft_manager = NftManager::new();
     let mut last_applied_config = None::<AppConfig>;
 
     loop {
         match AppConfig::load_for_runtime(config_path) {
             Ok(config) => {
                 let config_changed = last_applied_config.as_ref() != Some(&config);
-                let applied = manager.reconcile(config.enabled_tunnels()).await;
+                let desired_tunnels = config.enabled_tunnels();
+                let applied = match config.mode {
+                    AppMode::Socket => {
+                        let applied = socket_manager.reconcile(desired_tunnels).await;
+                        if applied
+                            && last_applied_config
+                                .as_ref()
+                                .is_some_and(|current| current.mode == AppMode::Nft)
+                        {
+                            nft_manager.stop_all().await;
+                        }
+                        applied
+                    }
+                    AppMode::Nft => {
+                        let applied = nft_manager.reconcile(desired_tunnels).await;
+                        if applied
+                            && last_applied_config
+                                .as_ref()
+                                .is_some_and(|current| current.mode == AppMode::Socket)
+                        {
+                            socket_manager.stop_all().await;
+                        }
+                        applied
+                    }
+                };
                 if applied {
                     last_applied_config = Some(config);
                 } else if config_changed {
                     eprintln!(
-                        "Will retry the current config on the next poll because some tunnels failed to start."
+                        "Will retry the current config on the next poll because some rules or tunnels failed to start."
                     );
                 } else {
-                    eprintln!(
-                        "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
-                    );
+                    match config.mode {
+                        AppMode::Socket => eprintln!(
+                            "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
+                        ),
+                        AppMode::Nft => {}
+                    }
                 }
             }
             Err(error) => {
@@ -271,7 +313,8 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
         }
     }
 
-    manager.stop_all().await;
+    socket_manager.stop_all().await;
+    nft_manager.stop_all().await;
     Ok(())
 }
 
@@ -298,10 +341,9 @@ async fn run_tcp_tunnel(
                     }
                 };
                 let target = spec.target.clone();
-                let tcp_mode = spec.tcp_mode;
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
-                    if let Err(error) = handle_tcp_connection(inbound, &target, tcp_mode, connection_stop).await {
+                    if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
                         log_tcp_connection_error(error.as_ref());
                     }
                 });
@@ -382,7 +424,6 @@ fn is_expected_tcp_disconnect_message(message: &str) -> bool {
 async fn handle_tcp_connection(
     inbound: TcpStream,
     target: &str,
-    tcp_mode: TcpMode,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let outbound = tokio::select! {
@@ -390,31 +431,20 @@ async fn handle_tcp_connection(
         _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
     };
 
-    configure_tcp_streams(&inbound, &outbound, tcp_mode)?;
+    configure_tcp_streams(&inbound, &outbound)?;
 
     #[cfg(target_os = "linux")]
     {
-        match tcp_mode.effective() {
-            TcpMode::Throughput => handle_tcp_connection_splice(inbound, outbound, stop_rx).await,
-            TcpMode::Latency => handle_tcp_connection_copy(inbound, outbound, stop_rx).await,
-            TcpMode::Auto => {
-                unreachable!("auto mode should resolve before selecting a runtime path")
-            }
-        }
+        handle_tcp_connection_splice(inbound, outbound, stop_rx).await
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = tcp_mode;
         handle_tcp_connection_copy(inbound, outbound, stop_rx).await
     }
 }
 
-fn configure_tcp_streams(
-    inbound: &TcpStream,
-    outbound: &TcpStream,
-    tcp_mode: TcpMode,
-) -> io::Result<()> {
+fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Result<()> {
     inbound.set_nodelay(true)?;
     outbound.set_nodelay(true)?;
     #[cfg(unix)]
@@ -428,21 +458,6 @@ fn configure_tcp_streams(
             outbound.as_raw_fd(),
             TCP_SOCKET_BUFFER_SIZE,
             TCP_SOCKET_BUFFER_SIZE,
-        )?;
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(tcp_mode.effective(), TcpMode::Latency) {
-        set_socket_option(
-            inbound.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_QUICKACK,
-            1,
-        )?;
-        set_socket_option(
-            outbound.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_QUICKACK,
-            1,
         )?;
     }
     Ok(())
@@ -461,6 +476,7 @@ fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn handle_tcp_connection_copy(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
@@ -589,7 +605,9 @@ fn splice_raw(fd_in: RawFd, fd_out: RawFd, length: usize) -> io::Result<usize> {
                 fd_out,
                 std::ptr::null_mut(),
                 length,
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE | libc::SPLICE_F_NONBLOCK,
+                // `SPLICE_F_MORE` can batch tiny writes and add ~100-400ms latency to
+                // request/response traffic, which is unacceptable for tunnel RTT.
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
             )
         };
 

@@ -13,30 +13,24 @@ use super::helpers::{
 async fn tcp_tunnels_keep_serving_other_modes_after_peer_failures() {
     let auto_backend = TcpEchoServer::spawn().await;
     let throughput_backend = TcpEchoServer::spawn().await;
-    let latency_backend = TcpEchoServer::spawn().await;
+    let second_throughput_backend = TcpEchoServer::spawn().await;
     let broken_target = reserve_tcp_addr();
 
     let auto_listen = reserve_tcp_addr();
     let throughput_listen = reserve_tcp_addr();
-    let latency_listen = reserve_tcp_addr();
+    let second_throughput_listen = reserve_tcp_addr();
     let broken_listen = reserve_tcp_addr();
 
     let mut manager = TunnelManager::default();
     let specs = vec![
-        tcp_tunnel_spec("auto", auto_listen, auto_backend.addr, TcpMode::Auto),
+        tcp_tunnel_spec("primary", auto_listen, auto_backend.addr),
+        tcp_tunnel_spec("throughput", throughput_listen, throughput_backend.addr),
         tcp_tunnel_spec(
-            "throughput",
-            throughput_listen,
-            throughput_backend.addr,
-            TcpMode::Throughput,
+            "throughput-second",
+            second_throughput_listen,
+            second_throughput_backend.addr,
         ),
-        tcp_tunnel_spec(
-            "latency",
-            latency_listen,
-            latency_backend.addr,
-            TcpMode::Latency,
-        ),
-        tcp_tunnel_spec("broken", broken_listen, broken_target, TcpMode::Throughput),
+        tcp_tunnel_spec("broken", broken_listen, broken_target),
     ];
 
     assert!(manager.reconcile(specs).await);
@@ -46,7 +40,10 @@ async fn tcp_tunnels_keep_serving_other_modes_after_peer_failures() {
         throughput_listen,
         b"throughput-payload",
     ));
-    let latency_task = tokio::spawn(assert_tcp_round_trip(latency_listen, b"latency"));
+    let second_throughput_task = tokio::spawn(assert_tcp_round_trip(
+        second_throughput_listen,
+        b"throughput-second",
+    ));
     let broken_task = tokio::spawn(async move {
         let mut stream = TcpStream::connect(broken_listen)
             .await
@@ -62,21 +59,21 @@ async fn tcp_tunnels_keep_serving_other_modes_after_peer_failures() {
     throughput_task
         .await
         .expect("throughput tunnel task should succeed");
-    latency_task
+    second_throughput_task
         .await
-        .expect("latency tunnel task should succeed");
+        .expect("second throughput tunnel task should succeed");
     broken_task
         .await
         .expect("broken tunnel task should succeed");
 
     assert_tcp_round_trip(auto_listen, b"auto-still-works").await;
     assert_tcp_round_trip(throughput_listen, b"throughput-still-works").await;
-    assert_tcp_round_trip(latency_listen, b"latency-still-works").await;
+    assert_tcp_round_trip(second_throughput_listen, b"throughput-second-still-works").await;
 
     manager.stop_all().await;
     auto_backend.stop().await;
     throughput_backend.stop().await;
-    latency_backend.stop().await;
+    second_throughput_backend.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -87,12 +84,7 @@ async fn tcp_tunnel_survives_abrupt_client_disconnect() {
     let mut manager = TunnelManager::default();
     assert!(
         manager
-            .reconcile(vec![tcp_tunnel_spec(
-                "client-drop",
-                listen,
-                backend.addr,
-                TcpMode::Latency,
-            )])
+            .reconcile(vec![tcp_tunnel_spec("client-drop", listen, backend.addr,)])
             .await
     );
 
@@ -120,12 +112,9 @@ async fn tcp_tunnel_recovers_after_upstream_drops_one_connection() {
     let mut manager = TunnelManager::default();
     assert!(
         manager
-            .reconcile(vec![tcp_tunnel_spec(
-                "upstream-drop",
-                listen,
-                backend.addr,
-                TcpMode::Throughput,
-            )])
+            .reconcile(vec![
+                tcp_tunnel_spec("upstream-drop", listen, backend.addr,)
+            ])
             .await
     );
 

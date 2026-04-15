@@ -15,7 +15,7 @@
 - 后台守护进程模式，并支持配置热更新
 - 使用 `./vorto config` 进行交互式配置
 - TCP、UDP、双协议转发
-- 按 tunnel 单独选择 TCP 转发策略
+- 顶层转发模式选择：`socket` 或 `nft`
 
 配置文件固定保存在当前工作目录下的 `./config.yaml`。
 
@@ -26,7 +26,6 @@
 - 原子化保存配置文件
 - 后台模式按配置差异热更新，不重启未变化的 tunnel
 - Linux 下 TCP 大流量路径使用 `splice`
-- 每个 tunnel 都可以单独配置 `tcp_mode`
 
 ## 构建
 
@@ -68,10 +67,10 @@ Usage:
 Config editor
 File: /root/vorto/config.yaml
 Tunnels: 0 total, 0 enabled, 0 disabled
+Forwarding mode: socket listeners
 Daemon log file: disabled
-
-No.  Name               Proto    TCP mode     State      Remote target            Local listen
------------------------------------------------------------------------------------------------------
+No.  Name               Proto    State      Remote target            Local listen
+---------------------------------------------------------------------------------------
 (no tunnels configured)
 
 Actions:
@@ -79,11 +78,12 @@ Actions:
   e = edit tunnel
   t = toggle enabled/disabled
   d = delete tunnel
+  m = toggle forwarding mode (socket/nft)
   l = toggle daemon log file
   s = save and exit
   q = quit
 
-Action [a/e/t/d/l/s/q]:
+Action [a/e/t/d/m/l/s/q]:
 └─ 
 ```
 
@@ -93,26 +93,24 @@ Action [a/e/t/d/l/s/q]:
 
 ```yaml
 daemon_log: true
+mode: socket
 
 tunnels:
   - name: web
     enabled: true
     protocol: tcp
-    tcp_mode: throughput
     target: 203.0.113.10:443
     listen: 0.0.0.0:8443
 
   - name: dns
     enabled: true
     protocol: udp
-    tcp_mode: auto
     target: 1.1.1.1:53
     listen: 127.0.0.1:5353
 
   - name: game
     enabled: true
     protocol: both
-    tcp_mode: latency
     target: 198.51.100.20:30000
     listen: 0.0.0.0:30000
 ```
@@ -120,27 +118,31 @@ tunnels:
 ### 字段说明
 
 - `daemon_log`：后台模式是否将 stdout/stderr 写入 `./vorto.log`
+- `mode`：转发后端。默认是 `socket`，`nft` 仅支持 Linux
 - `name`：唯一的 tunnel 名称
 - `enabled`：是否启用该 tunnel
 - `protocol`：`tcp`、`udp` 或 `both`
-- `tcp_mode`：`auto`、`throughput` 或 `latency`
 - `target`：远端目标地址，格式为 `host:port`
 - `listen`：本地监听地址，格式为 `host:port`
 
-### `tcp_mode` 说明
+### `mode` 说明
 
-- `auto`：当前默认值。现阶段会落到 `throughput`
-- `throughput`：为大块 TCP 吞吐优化。Linux 下会走 `splice` 路径
-- `latency`：更适合交互流量和大量小 TCP 包。该模式会改走普通 copy 转发路径，并在 Linux 上应用额外的低延迟 socket 调优
+- `socket`：默认模式。`vorto` 在用户态打开监听端口并自行转发流量。
+- `nft`：仅 Linux 支持。`vorto` 会在进程存活期间创建一套专用的 nftables NAT 表，并在退出时删除。
 
-对于纯 UDP tunnel，`tcp_mode` 会被忽略。
+`nft` 模式要求：
+
+- Linux 且系统中可用 `nft` 命令
+- 拥有修改 nftables 的权限
+- 每个启用的 tunnel 都必须使用明确的 IPv4 `listen` 地址
+- `target` 也必须是 IPv4
 
 ## 运行时行为
 
 ### 前台模式
 
 - 启动时只读取一次 `config.yaml`
-- 拉起所有启用的 tunnel
+- 拉起所有启用的 tunnel，或为它们应用 nftables 规则集
 - 后续不会继续监听配置变化
 
 ### 后台模式
@@ -149,7 +151,8 @@ tunnels:
 - 按 tunnel 名称做差异比对
 - 删除已不存在的 tunnel
 - 启动新增加的 tunnel
-- 仅重启真正发生变化的 tunnel
+- `socket` 模式下仅重启真正发生变化的 tunnel
+- `nft` 模式下配置变化时会重建 nftables 规则集
 - 未变化的 tunnel 会保持运行，不会被无意义断流
 - `daemon_log: true` 时会把后台进程输出写到 `./vorto.log`
 - `daemon_log: false` 时会丢弃后台进程输出
@@ -170,20 +173,23 @@ tunnels:
 - 编辑 tunnel
 - 启用或禁用 tunnel
 - 删除 tunnel
+- 在 `socket` 和 `nft` 之间切换转发模式
 - 切换后台日志文件开关
 - 将修改保存回 `config.yaml`
 
 输入提示会换行显示，便于阅读：
 
 ```text
-Action [a/e/t/d/s/q]:
+Action [a/e/t/d/m/l/s/q]:
 └─ 
 ```
 
 ## 平台说明
 
 - TCP 转发在 Tokio 支持的平台上都能工作
-- Linux 下的大流量 TCP 性能最好，因为吞吐路径使用了 `splice`
+- Linux 下 TCP 会使用专门的 `splice` 路径
+- macOS 和 Windows 当前运行普通 copy 转发路径
+- `nft` 模式仅在 Linux 下可用
 - UDP 转发目前是用户态实现（在 Linux 下有基于 recvmmsg/sendmmsg 的批量收发优化）
 
 ## 开发

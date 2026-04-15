@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::AppResult;
-use crate::config::{AppConfig, Protocol, TcpMode, TunnelConfig};
+use crate::config::{AppConfig, AppMode, Protocol, TunnelConfig};
 
 pub fn manage_config(path: &Path) -> AppResult<()> {
     let mut config = AppConfig::load_or_default(path)?;
@@ -11,7 +11,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
     loop {
         render_dashboard(path, &config, dirty);
 
-        match prompt("Action [a/e/t/d/l/s/q]")?
+        match prompt("Action [a/e/t/d/m/l/s/q]")?
             .trim()
             .to_ascii_lowercase()
             .as_str()
@@ -20,6 +20,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
             "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
             "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
             "d" | "delete" => dirty |= delete_tunnel(&mut config)?,
+            "m" | "mode" => dirty |= toggle_mode(&mut config),
             "l" | "log" => dirty |= toggle_daemon_log(&mut config),
             "s" | "save" => {
                 config.save(path)?;
@@ -35,7 +36,7 @@ pub fn manage_config(path: &Path) -> AppResult<()> {
                 return Ok(());
             }
             "" => {}
-            _ => println!("Unknown action. Use a, e, t, d, l, s, or q."),
+            _ => println!("Unknown action. Use a, e, t, d, m, l, s, or q."),
         }
     }
 }
@@ -60,6 +61,13 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
         if dirty { " | unsaved changes" } else { "" }
     );
     println!(
+        "Forwarding mode: {}",
+        match config.mode {
+            AppMode::Socket => "socket listeners",
+            AppMode::Nft => "nftables NAT",
+        }
+    );
+    println!(
         "Daemon log file: {}",
         if config.daemon_log {
             "enabled (./vorto.log)"
@@ -69,21 +77,20 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     );
     println!();
     println!(
-        "{:<4} {:<18} {:<8} {:<12} {:<10} {:<24} Local listen",
-        "No.", "Name", "Proto", "TCP mode", "State", "Remote target",
+        "{:<4} {:<18} {:<8} {:<10} {:<24} Local listen",
+        "No.", "Name", "Proto", "State", "Remote target",
     );
-    println!("{}", "-".repeat(101));
+    println!("{}", "-".repeat(87));
 
     if config.tunnels.is_empty() {
         println!("(no tunnels configured)");
     } else {
         for (index, tunnel) in config.tunnels.iter().enumerate() {
             println!(
-                "{:<4} {:<18} {:<8} {:<12} {:<10} {:<24} {}",
+                "{:<4} {:<18} {:<8} {:<10} {:<24} {}",
                 index + 1,
                 truncate(&tunnel.name, 18),
                 tunnel.protocol.label(),
-                truncate(tcp_mode_display(tunnel), 12),
                 if tunnel.enabled {
                     "enabled"
                 } else {
@@ -101,6 +108,7 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     println!("  e = edit tunnel");
     println!("  t = toggle enabled/disabled");
     println!("  d = delete tunnel");
+    println!("  m = toggle forwarding mode (socket/nft)");
     println!("  l = toggle daemon log file");
     println!("  s = save and exit");
     println!("  q = quit");
@@ -113,7 +121,6 @@ fn add_tunnel(config: &mut AppConfig) -> AppResult<bool> {
 
     let name = prompt_new_name(config, None)?;
     let protocol = prompt_protocol(None)?;
-    let tcp_mode = prompt_tcp_mode(protocol, None)?;
     let target = prompt_socket_addr("Remote target address (host:port)", None)?;
     let listen = prompt_socket_addr("Local listen address (host:port)", None)?;
     let enabled = prompt_bool("Enable this tunnel now? [Y/n]", true)?;
@@ -121,7 +128,6 @@ fn add_tunnel(config: &mut AppConfig) -> AppResult<bool> {
     let tunnel = TunnelConfig {
         name,
         protocol,
-        tcp_mode,
         target,
         listen,
         enabled,
@@ -153,7 +159,6 @@ fn edit_tunnel(config: &mut AppConfig) -> AppResult<bool> {
 
     tunnel.name = prompt_new_name(config, Some(index))?;
     tunnel.protocol = prompt_protocol(Some(tunnel.protocol))?;
-    tunnel.tcp_mode = prompt_tcp_mode(tunnel.protocol, Some(tunnel.tcp_mode))?;
     tunnel.target = prompt_socket_addr("Remote target address", Some(tunnel.target.as_str()))?;
     tunnel.listen = prompt_socket_addr("Local listen address", Some(tunnel.listen.as_str()))?;
     tunnel.enabled = prompt_bool(
@@ -228,6 +233,15 @@ fn toggle_daemon_log(config: &mut AppConfig) -> bool {
             "disabled"
         }
     );
+    true
+}
+
+fn toggle_mode(config: &mut AppConfig) -> bool {
+    config.mode = match config.mode {
+        AppMode::Socket => AppMode::Nft,
+        AppMode::Nft => AppMode::Socket,
+    };
+    println!("Forwarding mode is now {}.", config.mode.label());
     true
 }
 
@@ -321,41 +335,6 @@ fn prompt_protocol(current: Option<Protocol>) -> AppResult<Protocol> {
     }
 }
 
-fn prompt_tcp_mode(protocol: Protocol, current: Option<TcpMode>) -> AppResult<TcpMode> {
-    if !protocol.supports_tcp() {
-        println!("TCP forwarding mode is not used for UDP-only tunnels.");
-        return Ok(TcpMode::Auto);
-    }
-
-    loop {
-        let default_label = current.unwrap_or(TcpMode::Auto).label();
-        println!("TCP mode options:");
-        println!("  auto        = current safe default, optimized for throughput");
-        println!("  throughput  = highest bulk transfer throughput");
-        println!("  latency     = better fit for many small packets and interactive traffic");
-        let input = prompt(&format!("TCP forwarding mode [default: {}]", default_label))?;
-        let value = input.trim().to_ascii_lowercase();
-
-        let selected = if value.is_empty() {
-            current.or(Some(TcpMode::Auto))
-        } else {
-            match value.as_str() {
-                "1" | "auto" => Some(TcpMode::Auto),
-                "2" | "throughput" | "bulk" => Some(TcpMode::Throughput),
-                "3" | "latency" | "small" => Some(TcpMode::Latency),
-                _ => {
-                    println!("Invalid TCP mode. Use auto, throughput, or latency.");
-                    continue;
-                }
-            }
-        };
-
-        if let Some(tcp_mode) = selected {
-            return Ok(tcp_mode);
-        }
-    }
-}
-
 fn prompt_socket_addr(label: &str, current: Option<&str>) -> AppResult<String> {
     loop {
         let input = prompt_optional(label, current)?;
@@ -394,7 +373,6 @@ fn prompt_bool(label: &str, default: bool) -> AppResult<bool> {
 fn print_tunnel_details(tunnel: &TunnelConfig) {
     println!("  Name         : {}", tunnel.name);
     println!("  Protocol     : {}", tunnel.protocol.label());
-    println!("  TCP mode     : {}", tcp_mode_description(tunnel));
     println!("  Remote target: {}", tunnel.target);
     println!("  Local listen : {}", tunnel.listen);
     println!(
@@ -426,25 +404,6 @@ fn prompt_optional(label: &str, current: Option<&str>) -> AppResult<String> {
         .map(|value| format!(" [default: {}]", value))
         .unwrap_or_default();
     prompt(&format!("{}{}", label, suffix))
-}
-
-fn tcp_mode_display(tunnel: &TunnelConfig) -> &'static str {
-    if tunnel.protocol.supports_tcp() {
-        tunnel.tcp_mode.label()
-    } else {
-        "-"
-    }
-}
-
-fn tcp_mode_description(tunnel: &TunnelConfig) -> String {
-    if !tunnel.protocol.supports_tcp() {
-        return "not used for UDP-only tunnels".to_string();
-    }
-
-    match tunnel.tcp_mode {
-        TcpMode::Auto => "auto (currently uses throughput mode)".to_string(),
-        explicit => explicit.label().to_string(),
-    }
 }
 
 fn prompt(label: &str) -> AppResult<String> {

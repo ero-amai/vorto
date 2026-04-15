@@ -19,7 +19,6 @@ async fn active_tunnel_spawn_rolls_back_partial_start_on_udp_bind_failure() {
         listen: listen.to_string(),
         target: target.to_string(),
         protocol: Protocol::Both,
-        tcp_mode: TcpMode::Throughput,
         enabled: true,
     };
 
@@ -46,7 +45,7 @@ async fn active_tunnel_spawn_rolls_back_partial_start_on_udp_bind_failure() {
 async fn reconcile_restarts_finished_tunnels() {
     let backend = TcpEchoServer::spawn().await;
     let listen = reserve_tcp_addr();
-    let spec = tcp_tunnel_spec("recycle", listen, backend.addr, TcpMode::Latency);
+    let spec = tcp_tunnel_spec("recycle", listen, backend.addr);
 
     let (stop_tx, _) = watch::channel(false);
     let finished_handle = tokio::spawn(async {});
@@ -80,7 +79,7 @@ async fn reconcile_restarts_finished_tunnels() {
 async fn reconcile_restarts_panicked_tunnels() {
     let backend = TcpEchoServer::spawn().await;
     let listen = reserve_tcp_addr();
-    let spec = tcp_tunnel_spec("panic-recycle", listen, backend.addr, TcpMode::Throughput);
+    let spec = tcp_tunnel_spec("panic-recycle", listen, backend.addr);
 
     let (stop_tx, _) = watch::channel(false);
     let panicked_handle = tokio::spawn(async {
