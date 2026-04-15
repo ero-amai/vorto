@@ -1,9 +1,9 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Once;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -27,6 +27,7 @@ use crate::config::{AppConfig, TcpMode, TunnelConfig};
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
@@ -66,6 +67,8 @@ impl TunnelManager {
     }
 
     pub async fn reconcile(&mut self, desired_tunnels: Vec<TunnelConfig>) -> bool {
+        self.retire_finished_tunnels().await;
+
         let desired_map = desired_tunnels
             .into_iter()
             .map(|tunnel| (tunnel.name.clone(), tunnel))
@@ -108,6 +111,24 @@ impl TunnelManager {
         all_started
     }
 
+    async fn retire_finished_tunnels(&mut self) {
+        let finished = self
+            .active
+            .iter()
+            .filter_map(|(name, active)| active.has_finished().then_some(name.clone()))
+            .collect::<Vec<_>>();
+
+        for name in finished {
+            eprintln!(
+                "Tunnel '{}' worker exited unexpectedly; recycling the tunnel state.",
+                name
+            );
+            if let Some(active) = self.active.remove(&name) {
+                active.stop().await;
+            }
+        }
+    }
+
     pub async fn stop_all(&mut self) {
         let names = self.active.keys().cloned().collect::<Vec<_>>();
         for name in names {
@@ -123,29 +144,42 @@ impl ActiveTunnel {
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut handles = Vec::new();
 
-        if spec.protocol.supports_tcp() {
-            let tcp_listener = TcpListener::bind(&spec.listen).await?;
-            let tcp_spec = spec.clone();
-            let tcp_name = tcp_spec.name.clone();
-            let tcp_stop = stop_rx.clone();
-            handles.push(tokio::spawn(async move {
-                if let Err(error) = run_tcp_tunnel(tcp_spec, tcp_listener, tcp_stop).await {
-                    eprintln!("TCP tunnel '{}' stopped: {}", tcp_name, error);
-                }
-            }));
-        }
+        let spawn_result: AppResult<()> = async {
+            if spec.protocol.supports_tcp() {
+                let tcp_listener = TcpListener::bind(&spec.listen).await?;
+                let tcp_spec = spec.clone();
+                let tcp_name = tcp_spec.name.clone();
+                let tcp_stop = stop_rx.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(error) = run_tcp_tunnel(tcp_spec, tcp_listener, tcp_stop).await {
+                        eprintln!("TCP tunnel '{}' stopped: {}", tcp_name, error);
+                    }
+                }));
+            }
 
-        if spec.protocol.supports_udp() {
-            let udp_socket = Arc::new(UdpSocket::bind(&spec.listen).await?);
-            configure_udp_socket(udp_socket.as_ref())?;
-            let udp_spec = spec.clone();
-            let udp_name = udp_spec.name.clone();
-            let udp_stop = stop_rx.clone();
-            handles.push(tokio::spawn(async move {
-                if let Err(error) = run_udp_tunnel(udp_spec, udp_socket, udp_stop).await {
-                    eprintln!("UDP tunnel '{}' stopped: {}", udp_name, error);
-                }
-            }));
+            if spec.protocol.supports_udp() {
+                let udp_socket = Arc::new(UdpSocket::bind(&spec.listen).await?);
+                configure_udp_socket(udp_socket.as_ref())?;
+                let udp_spec = spec.clone();
+                let udp_name = udp_spec.name.clone();
+                let udp_stop = stop_rx.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(error) = run_udp_tunnel(udp_spec, udp_socket, udp_stop).await {
+                        eprintln!("UDP tunnel '{}' stopped: {}", udp_name, error);
+                    }
+                }));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = spawn_result {
+            let _ = stop_tx.send(true);
+            for handle in handles {
+                wait_for_task_shutdown(handle, "tunnel worker").await;
+            }
+            return Err(error);
         }
 
         Ok(Self {
@@ -153,6 +187,10 @@ impl ActiveTunnel {
             stop_tx,
             handles,
         })
+    }
+
+    fn has_finished(&self) -> bool {
+        self.handles.iter().any(JoinHandle::is_finished)
     }
 
     async fn stop(self) {
@@ -165,13 +203,32 @@ impl ActiveTunnel {
 
 pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
     let config = AppConfig::load_for_runtime(config_path)?;
+    let desired_tunnels = config.enabled_tunnels();
     let mut manager = TunnelManager::default();
     if !manager.start_from_config(&config).await {
         manager.stop_all().await;
         return Err(io::Error::other("Failed to start one or more tunnels.").into());
     }
     println!("Foreground mode started. Press Ctrl+C to stop.");
-    wait_for_termination_signal().await?;
+
+    let mut health_tick = interval(HEALTH_CHECK_INTERVAL);
+    health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    health_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            result = wait_for_termination_signal() => {
+                result?;
+                break;
+            }
+            _ = health_tick.tick() => {
+                if !manager.reconcile(desired_tunnels.clone()).await {
+                    eprintln!("One or more foreground tunnels failed to restart. Will retry.");
+                }
+            }
+        }
+    }
+
     manager.stop_all().await;
     Ok(())
 }
@@ -183,15 +240,18 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
     loop {
         match AppConfig::load_for_runtime(config_path) {
             Ok(config) => {
-                if last_applied_config.as_ref() != Some(&config) {
-                    let applied = manager.reconcile(config.enabled_tunnels()).await;
-                    if applied {
-                        last_applied_config = Some(config);
-                    } else {
-                        eprintln!(
-                            "Will retry the current config on the next poll because some tunnels failed to start."
-                        );
-                    }
+                let config_changed = last_applied_config.as_ref() != Some(&config);
+                let applied = manager.reconcile(config.enabled_tunnels()).await;
+                if applied {
+                    last_applied_config = Some(config);
+                } else if config_changed {
+                    eprintln!(
+                        "Will retry the current config on the next poll because some tunnels failed to start."
+                    );
+                } else {
+                    eprintln!(
+                        "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
+                    );
                 }
             }
             Err(error) => {
@@ -279,7 +339,9 @@ async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
                 );
                 connections.abort_all();
                 while let Some(result) = connections.join_next().await {
-                    if let Err(error) = result && !error.is_cancelled() {
+                    if let Err(error) = result
+                        && !error.is_cancelled()
+                    {
                         eprintln!("TCP connection task failed after abort: {}", error);
                     }
                 }
@@ -874,7 +936,9 @@ async fn wait_for_task_shutdown(handle: JoinHandle<()>, label: &str) {
                 SHUTDOWN_GRACE_PERIOD
             );
             abort_handle.abort();
-            if let Err(error) = handle.await && !error.is_cancelled() {
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
                 eprintln!("{label} failed after abort: {}", error);
             }
         }
@@ -1238,3 +1302,7 @@ async fn wait_for_termination_signal() -> io::Result<()> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_tests/mod.rs"]
+mod tests;

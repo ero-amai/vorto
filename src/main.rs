@@ -110,7 +110,10 @@ fn start_daemon(cwd: &Path, config_path: &Path, pid_path: &Path, log_path: &Path
             log_path.display()
         );
     } else {
-        println!("Daemon started with PID {}. Log file output is disabled.", child.id());
+        println!(
+            "Daemon started with PID {}. Log file output is disabled.",
+            child.id()
+        );
     }
     Ok(())
 }
@@ -333,11 +336,11 @@ fn is_daemon_worker_command(command: &str, binary_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::{is_daemon_worker_cmdline, platform_pid};
     #[cfg(all(unix, not(target_os = "linux")))]
     use super::is_daemon_worker_command;
     use super::parse_pid;
+    #[cfg(unix)]
+    use super::{is_daemon_worker_cmdline, platform_pid};
 
     #[cfg(unix)]
     #[test]
@@ -377,8 +380,14 @@ mod tests {
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn daemon_worker_command_matches_expected_process() {
-        assert!(is_daemon_worker_command("/tmp/vorto __daemon_worker", "vorto"));
-        assert!(!is_daemon_worker_command("/usr/bin/python3 server.py", "vorto"));
+        assert!(is_daemon_worker_command(
+            "/tmp/vorto __daemon_worker",
+            "vorto"
+        ));
+        assert!(!is_daemon_worker_command(
+            "/usr/bin/python3 server.py",
+            "vorto"
+        ));
         assert!(!is_daemon_worker_command("/tmp/vorto run", "vorto"));
     }
 }

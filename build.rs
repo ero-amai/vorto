@@ -29,7 +29,9 @@ fn main() {
 }
 
 fn set_if_missing(key: &str, value: Option<&str>) {
-    if env::var_os(key).is_none() && let Some(value) = value {
+    if env::var_os(key).is_none()
+        && let Some(value) = value
+    {
         println!("cargo:rustc-env={key}={value}");
     }
 }
