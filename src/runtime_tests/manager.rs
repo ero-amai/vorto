@@ -110,3 +110,45 @@ async fn reconcile_restarts_panicked_tunnels() {
     manager.stop_all().await;
     backend.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_tunnel_stop_aborts_stalled_workers_in_parallel() {
+    let (stop_tx, _) = watch::channel(false);
+    let active = ActiveTunnel {
+        spec: tcp_tunnel_spec("parallel-worker-stop", reserve_tcp_addr(), reserve_tcp_addr()),
+        stop_tx,
+        handles: vec![
+            tokio::spawn(std::future::pending::<()>()),
+            tokio::spawn(std::future::pending::<()>()),
+        ],
+    };
+
+    timeout(Duration::from_secs(5), active.stop())
+        .await
+        .expect("stalled workers should be aborted in parallel within one grace period");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_all_aborts_stalled_tunnels_in_parallel() {
+    let mut manager = TunnelManager::default();
+
+    for index in 0..2 {
+        let (stop_tx, _) = watch::channel(false);
+        manager.active.insert(
+            format!("stalled-{index}"),
+            ActiveTunnel {
+                spec: tcp_tunnel_spec(
+                    &format!("stalled-{index}"),
+                    reserve_tcp_addr(),
+                    reserve_tcp_addr(),
+                ),
+                stop_tx,
+                handles: vec![tokio::spawn(std::future::pending::<()>())],
+            },
+        );
+    }
+
+    timeout(Duration::from_secs(5), manager.stop_all())
+        .await
+        .expect("multiple stalled tunnels should stop in parallel within one grace period");
+}

@@ -12,7 +12,7 @@ use tokio::io::Interest;
 #[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -34,6 +34,9 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 60;
+const TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 15;
+const TCP_KEEPALIVE_PROBES: libc::c_int = 4;
 #[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
@@ -137,10 +140,18 @@ impl TunnelManager {
     }
 
     pub async fn stop_all(&mut self) {
-        let names = self.active.keys().cloned().collect::<Vec<_>>();
-        for name in names {
-            if let Some(active) = self.active.remove(&name) {
+        let active_tunnels = self.active.drain().map(|(_, active)| active).collect::<Vec<_>>();
+        let mut shutdown_tasks = JoinSet::new();
+
+        for active in active_tunnels {
+            shutdown_tasks.spawn(async move {
                 active.stop().await;
+            });
+        }
+
+        while let Some(result) = shutdown_tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("Tunnel shutdown task failed: {}", error);
             }
         }
     }
@@ -202,8 +213,18 @@ impl ActiveTunnel {
 
     async fn stop(self) {
         let _ = self.stop_tx.send(true);
+        let mut shutdown_tasks = JoinSet::new();
+
         for handle in self.handles {
-            wait_for_task_shutdown(handle, "tunnel worker").await;
+            shutdown_tasks.spawn(async move {
+                wait_for_task_shutdown(handle, "tunnel worker").await;
+            });
+        }
+
+        while let Some(result) = shutdown_tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("Tunnel worker shutdown task failed: {}", error);
+            }
         }
     }
 }
@@ -325,11 +346,27 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
 async fn run_tcp_tunnel(
     spec: TunnelConfig,
     listener: TcpListener,
+    stop_rx: watch::Receiver<bool>,
+) -> AppResult<()> {
+    run_tcp_tunnel_with_limiter(
+        spec,
+        listener,
+        stop_rx,
+        tcp_connection_limiter(),
+        tcp_connection_limit(),
+    )
+    .await
+}
+
+async fn run_tcp_tunnel_with_limiter(
+    spec: TunnelConfig,
+    listener: TcpListener,
     mut stop_rx: watch::Receiver<bool>,
+    connection_limiter: Arc<Semaphore>,
+    connection_limit: usize,
 ) -> AppResult<()> {
     let mut connections = JoinSet::new();
     let tunnel_name = spec.name.clone();
-    let connection_limiter = tcp_connection_limiter();
     let mut last_overload_log = None;
 
     loop {
@@ -346,26 +383,40 @@ async fn run_tcp_tunnel(
                         continue;
                     }
                 };
+
                 let permit = match connection_limiter.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
                         if should_log_tcp_overload(&mut last_overload_log) {
                             eprintln!(
-                                "TCP tunnel '{}' is at the active connection limit ({}); rejecting new connections.",
+                                "TCP tunnel '{}' is at the global active connection limit ({}); pausing accepts until an active connection closes.",
                                 tunnel_name,
-                                tcp_connection_limit()
+                                connection_limit
                             );
                         }
-                        drop(inbound);
-                        continue;
+
+                        match wait_for_tcp_connection_permit(
+                            connection_limiter.clone(),
+                            &mut stop_rx,
+                        )
+                        .await
+                        {
+                            Some(permit) => permit,
+                            None => {
+                                drop(inbound);
+                                break;
+                            }
+                        }
                     }
                 };
+
                 let target = spec.target.clone();
+                let connection_tunnel_name = tunnel_name.clone();
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
-                        log_tcp_connection_error(error.as_ref());
+                        log_tcp_connection_error(&connection_tunnel_name, &target, error.as_ref());
                     }
                 });
             }
@@ -383,6 +434,16 @@ async fn run_tcp_tunnel(
     drain_tcp_connections(&mut connections).await;
 
     Ok(())
+}
+
+async fn wait_for_tcp_connection_permit(
+    connection_limiter: Arc<Semaphore>,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        permit = connection_limiter.acquire_owned() => permit.ok(),
+        _ = wait_for_shutdown(stop_rx) => None,
+    }
 }
 
 fn should_log_tcp_overload(last_log: &mut Option<Instant>) -> bool {
@@ -461,12 +522,24 @@ async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
     }
 }
 
-fn log_tcp_connection_error(error: &dyn std::error::Error) {
+fn log_tcp_connection_error(tunnel_name: &str, target: &str, error: &dyn std::error::Error) {
+    let message = error.to_string();
     if is_expected_tcp_disconnect_message(&error.to_string()) {
         return;
     }
 
-    eprintln!("TCP connection handling failed: {}", error);
+    if is_connectivity_failure_message(&message) {
+        eprintln!(
+            "TCP tunnel '{}' could not reach target {}: {}",
+            tunnel_name, target, message
+        );
+        return;
+    }
+
+    eprintln!(
+        "TCP tunnel '{}' connection to {} failed: {}",
+        tunnel_name, target, message
+    );
 }
 
 fn log_tunnel_worker_error(
@@ -487,6 +560,14 @@ fn is_expected_tcp_disconnect_message(message: &str) -> bool {
         || message.contains("connection reset")
         || message.contains("connection aborted")
         || message.contains("unexpected eof")
+}
+
+fn is_connectivity_failure_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no route to host")
+        || message.contains("timed out connecting to target")
+        || message.contains("connection refused")
+        || message.contains("network is unreachable")
 }
 
 async fn handle_tcp_connection(
@@ -536,11 +617,13 @@ fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Resul
             TCP_SOCKET_BUFFER_SIZE,
             TCP_SOCKET_BUFFER_SIZE,
         )?;
+        tune_tcp_keepalive(inbound.as_raw_fd())?;
         tune_socket_buffers(
             outbound.as_raw_fd(),
             TCP_SOCKET_BUFFER_SIZE,
             TCP_SOCKET_BUFFER_SIZE,
         )?;
+        tune_tcp_keepalive(outbound.as_raw_fd())?;
     }
     Ok(())
 }
@@ -1162,6 +1245,30 @@ fn tune_socket_buffers(
 
 #[cfg(not(unix))]
 fn tune_socket_buffers(_fd: i32, _recv_bytes: i32, _send_bytes: i32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tune_tcp_keepalive(fd: libc::c_int) -> io::Result<()> {
+    set_socket_option(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        set_socket_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SECS)?;
+        set_socket_option(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            TCP_KEEPALIVE_INTERVAL_SECS,
+        )?;
+        set_socket_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, TCP_KEEPALIVE_PROBES)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tune_tcp_keepalive(_fd: i32) -> io::Result<()> {
     Ok(())
 }
 
