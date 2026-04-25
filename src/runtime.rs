@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -11,7 +12,7 @@ use tokio::io::Interest;
 #[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -31,6 +32,8 @@ const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
@@ -45,6 +48,7 @@ const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
 const SPLICE_PIPE_SIZE: libc::c_int = 1_048_576;
 #[cfg(target_os = "linux")]
 static PIPE_SIZE_WARNING: Once = Once::new();
+static TCP_CONNECTION_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct TunnelManager {
@@ -325,6 +329,8 @@ async fn run_tcp_tunnel(
 ) -> AppResult<()> {
     let mut connections = JoinSet::new();
     let tunnel_name = spec.name.clone();
+    let connection_limiter = tcp_connection_limiter();
+    let mut last_overload_log = None;
 
     loop {
         tokio::select! {
@@ -340,9 +346,24 @@ async fn run_tcp_tunnel(
                         continue;
                     }
                 };
+                let permit = match connection_limiter.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        if should_log_tcp_overload(&mut last_overload_log) {
+                            eprintln!(
+                                "TCP tunnel '{}' is at the active connection limit ({}); rejecting new connections.",
+                                tunnel_name,
+                                tcp_connection_limit()
+                            );
+                        }
+                        drop(inbound);
+                        continue;
+                    }
+                };
                 let target = spec.target.clone();
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
                         log_tcp_connection_error(error.as_ref());
                     }
@@ -362,6 +383,53 @@ async fn run_tcp_tunnel(
     drain_tcp_connections(&mut connections).await;
 
     Ok(())
+}
+
+fn should_log_tcp_overload(last_log: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    let should_log =
+        last_log.is_none_or(|last| now.duration_since(last) >= TCP_OVERLOAD_LOG_INTERVAL);
+    if should_log {
+        *last_log = Some(now);
+    }
+    should_log
+}
+
+fn tcp_connection_limiter() -> Arc<Semaphore> {
+    TCP_CONNECTION_LIMITER
+        .get_or_init(|| Arc::new(Semaphore::new(tcp_connection_limit())))
+        .clone()
+}
+
+fn tcp_connection_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+        if result == 0 {
+            let soft = unsafe { limit.assume_init() }.rlim_cur;
+            if soft != libc::RLIM_INFINITY {
+                let available = (soft as usize).saturating_sub(64);
+                return (available / tcp_fd_budget_per_connection()).clamp(1, 1024);
+            }
+        }
+    }
+
+    512
+}
+
+fn tcp_fd_budget_per_connection() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // Each spliced TCP connection owns inbound/outbound sockets plus one pipe
+        // for each forwarding direction.
+        6
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        2
+    }
 }
 
 async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
@@ -427,7 +495,21 @@ async fn handle_tcp_connection(
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let outbound = tokio::select! {
-        result = TcpStream::connect(target) => result?,
+        result = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(target)) => {
+            match result {
+                Ok(connect_result) => connect_result?,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out connecting to target {target} after {:?}",
+                            TCP_CONNECT_TIMEOUT
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
         _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
     };
 
