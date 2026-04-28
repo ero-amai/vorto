@@ -227,7 +227,7 @@ async fn tcp_multi_tunnel_chaos_soak() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual benchmark for throughput-mode forwarding latency"]
+#[ignore = "manual benchmark for socket-mode user-space forwarding latency"]
 async fn throughput_mode_forwarding_latency_benchmark() {
     let warmup = std::env::var("VORTO_LATENCY_WARMUP")
         .ok()
@@ -253,13 +253,13 @@ async fn throughput_mode_forwarding_latency_benchmark() {
     let tunneled = measure_tcp_echo_rtts(listen, warmup, samples, payload_size).await;
 
     print_latency_stats("direct", &direct);
-    print_latency_stats("throughput tunnel", &tunneled);
+    print_latency_stats("socket tunnel", &tunneled);
 
     let direct_p95 = percentile_us(&direct, 95.0);
     let tunneled_p95 = percentile_us(&tunneled, 95.0);
     let overhead_p95 = tunneled_p95.saturating_sub(direct_p95);
     println!(
-        "throughput latency overhead p95: {} us (direct p95={} us, tunnel p95={} us)",
+        "socket tunnel latency overhead p95: {} us (direct p95={} us, tunnel p95={} us)",
         overhead_p95, direct_p95, tunneled_p95
     );
 

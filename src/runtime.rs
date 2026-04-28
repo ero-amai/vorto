@@ -13,6 +13,8 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 
 use crate::AppResult;
 use crate::config::{AppConfig, AppMode, TunnelConfig};
