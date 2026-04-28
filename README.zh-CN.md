@@ -25,14 +25,14 @@
 - 交互式 tunnel 编辑器
 - 原子化保存配置文件
 - 后台模式按配置差异热更新，不重启未变化的 tunnel
-- Linux 下 TCP 大流量路径使用 `splice`
+- `socket` 模式下 TCP/UDP 均为用户态转发
 
 ## 构建
 
 环境要求：
 
 - Rust 工具链
-- 如果追求最佳 TCP 吞吐，建议运行在 Linux
+- `nft` 模式需要 Linux
 
 构建 release 版本：
 
@@ -187,8 +187,7 @@ Action [a/e/t/d/m/l/s/q]:
 ## 平台说明
 
 - TCP 转发在 Tokio 支持的平台上都能工作
-- Linux 下 TCP 会使用专门的 `splice` 路径
-- macOS 和 Windows 当前运行普通 copy 转发路径
+- `socket` 模式在 Linux、macOS、Windows 下都使用同一套用户态 TCP 转发路径
 - `nft` 模式仅在 Linux 下可用
 - UDP 转发目前是用户态实现（在 Linux 下有基于 recvmmsg/sendmmsg 的批量收发优化）
 

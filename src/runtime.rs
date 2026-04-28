@@ -2,26 +2,17 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::sync::Once;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
-use tokio::io::Interest;
-#[cfg(not(target_os = "linux"))]
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
-#[cfg(target_os = "linux")]
-use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::AppResult;
 use crate::config::{AppConfig, AppMode, TunnelConfig};
@@ -37,7 +28,6 @@ const TCP_OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 60;
 const TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 15;
 const TCP_KEEPALIVE_PROBES: libc::c_int = 4;
-#[cfg(not(target_os = "linux"))]
 const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
 const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
 const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
@@ -45,12 +35,6 @@ const UDP_PACKET_BUFFER_SIZE: usize = 65_535;
 const UDP_DRAIN_BURST: usize = 64;
 #[cfg(target_os = "linux")]
 const UDP_RECV_BATCH_SIZE: usize = 32;
-#[cfg(target_os = "linux")]
-const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
-#[cfg(target_os = "linux")]
-const SPLICE_PIPE_SIZE: libc::c_int = 1_048_576;
-#[cfg(target_os = "linux")]
-static PIPE_SIZE_WARNING: Once = Once::new();
 static TCP_CONNECTION_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Default)]
@@ -480,17 +464,7 @@ fn tcp_connection_limit() -> usize {
 }
 
 fn tcp_fd_budget_per_connection() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        // Each spliced TCP connection owns inbound/outbound sockets plus one pipe
-        // for each forwarding direction.
-        6
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        2
-    }
+    2
 }
 
 async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
@@ -596,15 +570,7 @@ async fn handle_tcp_connection(
 
     configure_tcp_streams(&inbound, &outbound)?;
 
-    #[cfg(target_os = "linux")]
-    {
-        handle_tcp_connection_splice(inbound, outbound, stop_rx).await
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        handle_tcp_connection_copy(inbound, outbound, stop_rx).await
-    }
+    handle_tcp_connection_copy(inbound, outbound, stop_rx).await
 }
 
 fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Result<()> {
@@ -641,7 +607,6 @@ fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
 async fn handle_tcp_connection_copy(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
@@ -660,198 +625,6 @@ async fn handle_tcp_connection_copy(
     }
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn handle_tcp_connection_splice(
-    inbound: TcpStream,
-    outbound: TcpStream,
-    mut stop_rx: watch::Receiver<bool>,
-) -> AppResult<()> {
-    let inbound = Arc::new(inbound);
-    let outbound = Arc::new(outbound);
-
-    tokio::select! {
-        result = async {
-            let result = tokio::try_join!(
-                splice_one_way(inbound.clone(), outbound.clone()),
-                splice_one_way(outbound.clone(), inbound.clone()),
-            );
-
-            if result.is_err() {
-                shutdown_socket(inbound.as_ref(), Shutdown::Both);
-                shutdown_socket(outbound.as_ref(), Shutdown::Both);
-            }
-
-            result
-        } => {
-            result?;
-        }
-        _ = wait_for_shutdown(&mut stop_rx) => {
-            shutdown_socket(inbound.as_ref(), Shutdown::Both);
-            shutdown_socket(outbound.as_ref(), Shutdown::Both);
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn splice_one_way(source: Arc<TcpStream>, destination: Arc<TcpStream>) -> io::Result<()> {
-    let pipe = SplicePipe::new()?;
-
-    loop {
-        source.readable().await?;
-        let copied = match source.try_io(Interest::READABLE, || {
-            splice_raw(
-                source.as_ref().as_raw_fd(),
-                pipe.write.as_raw_fd(),
-                SPLICE_CHUNK_SIZE,
-            )
-        }) {
-            Ok(copied) => copied,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(error),
-        };
-
-        if copied == 0 {
-            shutdown_socket(destination.as_ref(), Shutdown::Write);
-            return Ok(());
-        }
-
-        let mut remaining = copied;
-        while remaining > 0 {
-            destination.writable().await?;
-            let moved = match destination.try_io(Interest::WRITABLE, || {
-                splice_raw(
-                    pipe.read.as_raw_fd(),
-                    destination.as_ref().as_raw_fd(),
-                    remaining,
-                )
-            }) {
-                Ok(moved) => moved,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error),
-            };
-
-            if moved == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "splice returned zero bytes while forwarding to the destination socket",
-                ));
-            }
-
-            remaining -= moved;
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn shutdown_socket(stream: &TcpStream, how: Shutdown) {
-    let _ = unsafe { libc::shutdown(stream.as_raw_fd(), shutdown_mode(how)) };
-}
-
-#[cfg(target_os = "linux")]
-fn shutdown_mode(how: Shutdown) -> libc::c_int {
-    match how {
-        Shutdown::Read => libc::SHUT_RD,
-        Shutdown::Write => libc::SHUT_WR,
-        Shutdown::Both => libc::SHUT_RDWR,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn splice_raw(fd_in: RawFd, fd_out: RawFd, length: usize) -> io::Result<usize> {
-    loop {
-        let result = unsafe {
-            libc::splice(
-                fd_in,
-                std::ptr::null_mut(),
-                fd_out,
-                std::ptr::null_mut(),
-                length,
-                // `SPLICE_F_MORE` can batch tiny writes and add ~100-400ms latency to
-                // request/response traffic, which is unacceptable for tunnel RTT.
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
-            )
-        };
-
-        if result >= 0 {
-            return Ok(result as usize);
-        }
-
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-
-        return Err(error);
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct SplicePipe {
-    read: OwnedFd,
-    write: OwnedFd,
-}
-
-#[cfg(target_os = "linux")]
-impl SplicePipe {
-    fn new() -> io::Result<Self> {
-        let mut fds = [0; 2];
-        let flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        tune_splice_pipe_size(write.as_raw_fd());
-
-        Ok(Self { read, write })
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn tune_splice_pipe_size(fd: RawFd) {
-    let requested = SPLICE_PIPE_SIZE;
-    let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, requested) };
-    if result >= 0 {
-        let actual = result as libc::c_int;
-        if actual < requested {
-            warn_pipe_size_degraded(Some(actual), None);
-        }
-        return;
-    }
-
-    let error = io::Error::last_os_error();
-    let actual = pipe_size(fd);
-    warn_pipe_size_degraded(actual, Some(error));
-}
-
-#[cfg(target_os = "linux")]
-fn pipe_size(fd: RawFd) -> Option<libc::c_int> {
-    let result = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
-    (result >= 0).then_some(result as libc::c_int)
-}
-
-#[cfg(target_os = "linux")]
-fn warn_pipe_size_degraded(actual: Option<libc::c_int>, error: Option<io::Error>) {
-    PIPE_SIZE_WARNING.call_once(|| match (actual, error) {
-        (Some(actual), Some(error)) => eprintln!(
-            "Warning: failed to raise splice pipe size to {} bytes (current: {} bytes): {}",
-            SPLICE_PIPE_SIZE, actual, error
-        ),
-        (None, Some(error)) => eprintln!(
-            "Warning: failed to raise splice pipe size to {} bytes: {}",
-            SPLICE_PIPE_SIZE, error
-        ),
-        (Some(actual), None) => eprintln!(
-            "Warning: splice pipe size is {} bytes, below requested {} bytes.",
-            actual, SPLICE_PIPE_SIZE
-        ),
-        (None, None) => {}
-    });
 }
 
 async fn run_udp_tunnel(

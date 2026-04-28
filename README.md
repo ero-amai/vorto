@@ -28,14 +28,14 @@ Configuration is stored in `./config.yaml` in the current working directory.
 - Interactive tunnel editor
 - Atomic config saves
 - Daemon config diffing without restarting unchanged tunnels
-- Linux TCP throughput path using `splice`
+- TCP and UDP forwarding in user space for `socket` mode
 
 ## Build
 
 Requirements:
 
 - Rust toolchain
-- Linux is recommended for best TCP throughput
+- Linux is required for `nft` mode
 
 Build a release binary:
 
@@ -193,8 +193,7 @@ Action [a/e/t/d/m/l/s/q]:
 ## Platform Notes
 
 - TCP forwarding works on all supported Tokio platforms
-- Linux uses the dedicated `splice` TCP path
-- macOS and Windows run the regular copy-based TCP relay path
+- `socket` mode uses the same user-space TCP relay path on Linux, macOS, and Windows
 - `nft` mode is only available on Linux
 - UDP forwarding is implemented in user space (Linux batch I/O optimization via recvmmsg/sendmmsg)
 
