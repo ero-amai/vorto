@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -375,24 +375,13 @@ async fn run_tcp_tunnel_with_limiter(
                     Err(_) => {
                         if should_log_tcp_overload(&mut last_overload_log) {
                             eprintln!(
-                                "TCP tunnel '{}' is at the global active connection limit ({}); pausing accepts until an active connection closes.",
+                                "TCP tunnel '{}' is at the global active connection limit ({}); closing an excess accepted connection.",
                                 tunnel_name,
                                 connection_limit
                             );
                         }
-
-                        match wait_for_tcp_connection_permit(
-                            connection_limiter.clone(),
-                            &mut stop_rx,
-                        )
-                        .await
-                        {
-                            Some(permit) => permit,
-                            None => {
-                                drop(inbound);
-                                break;
-                            }
-                        }
+                        drop(inbound);
+                        continue;
                     }
                 };
 
@@ -422,16 +411,6 @@ async fn run_tcp_tunnel_with_limiter(
     Ok(())
 }
 
-async fn wait_for_tcp_connection_permit(
-    connection_limiter: Arc<Semaphore>,
-    stop_rx: &mut watch::Receiver<bool>,
-) -> Option<OwnedSemaphorePermit> {
-    tokio::select! {
-        permit = connection_limiter.acquire_owned() => permit.ok(),
-        _ = wait_for_shutdown(stop_rx) => None,
-    }
-}
-
 fn should_log_tcp_overload(last_log: &mut Option<Instant>) -> bool {
     let now = Instant::now();
     let should_log =
@@ -457,7 +436,7 @@ fn tcp_connection_limit() -> usize {
             let soft = unsafe { limit.assume_init() }.rlim_cur;
             if soft != libc::RLIM_INFINITY {
                 let available = (soft as usize).saturating_sub(64);
-                return (available / tcp_fd_budget_per_connection()).clamp(1, 1024);
+                return (available / tcp_fd_budget_per_connection()).max(1);
             }
         }
     }
