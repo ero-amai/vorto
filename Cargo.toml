@@ -7,9 +7,11 @@ repository = "https://github.com/ero-amai/vorto"
 
 [dependencies]
 libc = "0.2"
+relayport-rs = "0.5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1.48.0", features = ["full"] }
+udpproxi = "0.1.1"
 
 [dev-dependencies]
 serde_json = "1.0"

@@ -195,7 +195,7 @@ Action [a/e/t/d/m/l/s/q]:
 - TCP forwarding works on all supported Tokio platforms
 - `socket` mode uses the same user-space TCP relay path on Linux, macOS, and Windows
 - `nft` mode is only available on Linux
-- UDP forwarding is implemented in user space (Linux batch I/O optimization via recvmmsg/sendmmsg)
+- UDP forwarding is implemented in user space
 
 ## Development
 

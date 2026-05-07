@@ -1,43 +1,30 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use tokio::io::copy_bidirectional_with_sizes;
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
+use udpproxi::{UdpProxi, UdpProxiReceiver, UdpProxiSender};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
 
 use crate::AppResult;
 use crate::config::{AppConfig, AppMode, TunnelConfig};
 use crate::nft::NftManager;
 
-const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const TUNNEL_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TCP_OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 60;
-const TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 15;
-const TCP_KEEPALIVE_PROBES: libc::c_int = 4;
-const TCP_COPY_BUFFER_SIZE: usize = 256 * 1024;
-const TCP_SOCKET_BUFFER_SIZE: libc::c_int = 1_048_576;
 const UDP_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 65_535;
-const UDP_DRAIN_BURST: usize = 64;
-#[cfg(target_os = "linux")]
-const UDP_RECV_BATCH_SIZE: usize = 32;
-static TCP_CONNECTION_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct TunnelManager {
@@ -50,11 +37,13 @@ struct ActiveTunnel {
     handles: Vec<JoinHandle<()>>,
 }
 
-struct UdpSession {
-    upstream: Arc<UdpSocket>,
-    last_seen: Instant,
-    stop_tx: watch::Sender<bool>,
-    handle: JoinHandle<()>,
+#[derive(Clone)]
+struct UdpResponseSink {
+    socket: Weak<UdpSocket>,
+}
+
+struct ConnectedUdpEndpoint {
+    socket: UdpSocket,
 }
 
 impl TunnelManager {
@@ -150,25 +139,27 @@ impl ActiveTunnel {
 
         let spawn_result: AppResult<()> = async {
             if spec.protocol.supports_tcp() {
-                let tcp_listener = TcpListener::bind(&spec.listen).await?;
-                let tcp_spec = spec.clone();
-                let tcp_name = tcp_spec.name.clone();
+                let tcp_listener = build_tcp_listener(&spec.listen).await?;
+                let tcp_target = spec.target.clone();
+                let tcp_name = spec.name.clone();
                 let tcp_stop = stop_rx.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(error) = run_tcp_tunnel(tcp_spec, tcp_listener, tcp_stop).await {
+                    if let Err(error) = run_tcp_tunnel(tcp_listener, &tcp_target, tcp_stop).await {
                         eprintln!("TCP tunnel '{}' stopped: {}", tcp_name, error);
                     }
                 }));
             }
 
             if spec.protocol.supports_udp() {
-                let udp_socket = Arc::new(UdpSocket::bind(&spec.listen).await?);
-                configure_udp_socket(udp_socket.as_ref())?;
-                let udp_spec = spec.clone();
-                let udp_name = udp_spec.name.clone();
+                let udp_target = parse_socket_addr(&spec.target, "target")?;
+                let udp_listener = Arc::new(UdpSocket::bind(&spec.listen).await?);
+                configure_udp_socket(udp_listener.as_ref())?;
+                let udp_name = spec.name.clone();
                 let udp_stop = stop_rx.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(error) = run_udp_tunnel(udp_spec, udp_socket, udp_stop).await {
+                    if let Err(error) =
+                        run_udp_tunnel(udp_name.clone(), udp_listener, udp_target, udp_stop).await
+                    {
                         eprintln!("UDP tunnel '{}' stopped: {}", udp_name, error);
                     }
                 }));
@@ -329,31 +320,27 @@ pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> 
     Ok(())
 }
 
-async fn run_tcp_tunnel(
-    spec: TunnelConfig,
-    listener: TcpListener,
-    stop_rx: watch::Receiver<bool>,
-) -> AppResult<()> {
-    run_tcp_tunnel_with_limiter(
-        spec,
-        listener,
-        stop_rx,
-        tcp_connection_limiter(),
-        tcp_connection_limit(),
-    )
-    .await
+async fn build_tcp_listener(listen: &str) -> AppResult<TcpListener> {
+    Ok(TcpListener::bind(listen).await?)
 }
 
-async fn run_tcp_tunnel_with_limiter(
-    spec: TunnelConfig,
+fn parse_socket_addr(value: &str, label: &str) -> AppResult<SocketAddr> {
+    value.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid {label} address {value}: {error}"),
+        )
+        .into()
+    })
+}
+
+async fn run_tcp_tunnel(
     listener: TcpListener,
+    target: &str,
     mut stop_rx: watch::Receiver<bool>,
-    connection_limiter: Arc<Semaphore>,
-    connection_limit: usize,
 ) -> AppResult<()> {
     let mut connections = JoinSet::new();
-    let tunnel_name = spec.name.clone();
-    let mut last_overload_log = None;
+    let target = target.to_string();
 
     loop {
         tokio::select! {
@@ -364,39 +351,24 @@ async fn run_tcp_tunnel_with_limiter(
                         if *stop_rx.borrow() {
                             break;
                         }
-                        log_tunnel_worker_error("TCP", &tunnel_name, "accept", &error);
-                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
-                        continue;
+                        return Err(error.into());
                     }
                 };
 
-                let permit = match connection_limiter.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        if should_log_tcp_overload(&mut last_overload_log) {
-                            eprintln!(
-                                "TCP tunnel '{}' is at the global active connection limit ({}); closing an excess accepted connection.",
-                                tunnel_name,
-                                connection_limit
-                            );
-                        }
-                        drop(inbound);
-                        continue;
-                    }
-                };
-
-                let target = spec.target.clone();
-                let connection_tunnel_name = tunnel_name.clone();
+                let connection_target = target.clone();
                 let connection_stop = stop_rx.clone();
                 connections.spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = handle_tcp_connection(inbound, &target, connection_stop).await {
-                        log_tcp_connection_error(&connection_tunnel_name, &target, error.as_ref());
+                    if let Err(error) =
+                        handle_tcp_connection(inbound, &connection_target, connection_stop).await
+                    {
+                        eprintln!("TCP tunnel connection failed: {}", error);
                     }
                 });
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = result {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
                     eprintln!("TCP connection task failed: {}", error);
                 }
             }
@@ -411,41 +383,49 @@ async fn run_tcp_tunnel_with_limiter(
     Ok(())
 }
 
-fn should_log_tcp_overload(last_log: &mut Option<Instant>) -> bool {
-    let now = Instant::now();
-    let should_log =
-        last_log.is_none_or(|last| now.duration_since(last) >= TCP_OVERLOAD_LOG_INTERVAL);
-    if should_log {
-        *last_log = Some(now);
-    }
-    should_log
-}
-
-fn tcp_connection_limiter() -> Arc<Semaphore> {
-    TCP_CONNECTION_LIMITER
-        .get_or_init(|| Arc::new(Semaphore::new(tcp_connection_limit())))
-        .clone()
-}
-
-fn tcp_connection_limit() -> usize {
-    #[cfg(unix)]
-    {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
-        if result == 0 {
-            let soft = unsafe { limit.assume_init() }.rlim_cur;
-            if soft != libc::RLIM_INFINITY {
-                let available = (soft as usize).saturating_sub(64);
-                return (available / tcp_fd_budget_per_connection()).max(1);
+async fn handle_tcp_connection(
+    inbound: TcpStream,
+    target: &str,
+    mut stop_rx: watch::Receiver<bool>,
+) -> AppResult<()> {
+    let outbound = tokio::select! {
+        result = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(target)) => {
+            match result {
+                Ok(connect_result) => connect_result?,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out connecting to target {target} after {:?}", TCP_CONNECT_TIMEOUT),
+                    ).into());
+                }
             }
         }
-    }
+        _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
+    };
 
-    512
+    configure_tcp_streams(&inbound, &outbound)?;
+    handle_tcp_connection_copy(inbound, outbound, stop_rx).await
 }
 
-fn tcp_fd_budget_per_connection() -> usize {
-    2
+fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Result<()> {
+    inbound.set_nodelay(true)?;
+    outbound.set_nodelay(true)?;
+    Ok(())
+}
+
+async fn handle_tcp_connection_copy(
+    mut inbound: TcpStream,
+    mut outbound: TcpStream,
+    mut stop_rx: watch::Receiver<bool>,
+) -> AppResult<()> {
+    tokio::select! {
+        result = copy_bidirectional(&mut inbound, &mut outbound) => {
+            result?;
+        }
+        _ = wait_for_shutdown(&mut stop_rx) => {}
+    }
+
+    Ok(())
 }
 
 async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
@@ -477,102 +457,122 @@ async fn drain_tcp_connections(connections: &mut JoinSet<()>) {
     }
 }
 
-fn log_tcp_connection_error(tunnel_name: &str, target: &str, error: &dyn std::error::Error) {
-    let message = error.to_string();
-    if is_expected_tcp_disconnect_message(&error.to_string()) {
-        return;
-    }
-
-    if is_connectivity_failure_message(&message) {
-        eprintln!(
-            "TCP tunnel '{}' could not reach target {}: {}",
-            tunnel_name, target, message
-        );
-        return;
-    }
-
-    eprintln!(
-        "TCP tunnel '{}' connection to {} failed: {}",
-        tunnel_name, target, message
-    );
-}
-
-fn log_tunnel_worker_error(
-    protocol: &str,
-    tunnel_name: &str,
-    stage: &str,
-    error: &dyn std::error::Error,
-) {
-    eprintln!(
-        "{} tunnel '{}' {} failed: {}",
-        protocol, tunnel_name, stage, error
-    );
-}
-
-fn is_expected_tcp_disconnect_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("broken pipe")
-        || message.contains("connection reset")
-        || message.contains("connection aborted")
-        || message.contains("unexpected eof")
-}
-
-fn is_connectivity_failure_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("no route to host")
-        || message.contains("timed out connecting to target")
-        || message.contains("connection refused")
-        || message.contains("network is unreachable")
-}
-
-async fn handle_tcp_connection(
-    inbound: TcpStream,
-    target: &str,
+async fn run_udp_tunnel(
+    tunnel_name: String,
+    listener: Arc<UdpSocket>,
+    target: SocketAddr,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
-    let outbound = tokio::select! {
-        result = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(target)) => {
-            match result {
-                Ok(connect_result) => connect_result?,
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "timed out connecting to target {target} after {:?}",
-                            TCP_CONNECT_TIMEOUT
-                        ),
-                    )
-                    .into());
+    let response_sink = UdpResponseSink {
+        socket: Arc::downgrade(&listener),
+    };
+    let mut proxy = UdpProxi::new(response_sink, |_from, to| async move {
+        Ok(ConnectedUdpEndpoint {
+            socket: build_udp_upstream_socket(to).await?,
+        })
+    });
+    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_SIZE];
+
+    loop {
+        tokio::select! {
+            result = listener.recv_from(&mut buffer) => {
+                let (size, client_addr) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                        return Err(error.into());
+                    }
+                };
+
+                if let Err(error) = proxy.send_packet(&buffer[..size], client_addr, target).await {
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+                    eprintln!("UDP tunnel '{}' forward failed: {}", tunnel_name, error);
                 }
             }
+            _ = wait_for_shutdown(&mut stop_rx) => {
+                break;
+            }
         }
-        _ = wait_for_shutdown(&mut stop_rx) => return Ok(()),
-    };
+    }
 
-    configure_tcp_streams(&inbound, &outbound)?;
-
-    handle_tcp_connection_copy(inbound, outbound, stop_rx).await
+    Ok(())
 }
 
-fn configure_tcp_streams(inbound: &TcpStream, outbound: &TcpStream) -> io::Result<()> {
-    inbound.set_nodelay(true)?;
-    outbound.set_nodelay(true)?;
-    #[cfg(unix)]
-    {
-        tune_socket_buffers(
-            inbound.as_raw_fd(),
-            TCP_SOCKET_BUFFER_SIZE,
-            TCP_SOCKET_BUFFER_SIZE,
-        )?;
-        tune_tcp_keepalive(inbound.as_raw_fd())?;
-        tune_socket_buffers(
-            outbound.as_raw_fd(),
-            TCP_SOCKET_BUFFER_SIZE,
-            TCP_SOCKET_BUFFER_SIZE,
-        )?;
-        tune_tcp_keepalive(outbound.as_raw_fd())?;
+async fn build_udp_upstream_socket(target: SocketAddr) -> io::Result<UdpSocket> {
+    let bind_addr = match target {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    configure_udp_socket(&socket)?;
+    socket.connect(target).await?;
+    Ok(socket)
+}
+
+impl UdpProxiSender for ConnectedUdpEndpoint {
+    fn send<'a>(
+        &'a self,
+        packet: &'a [u8],
+        _from: SocketAddr,
+        _to: SocketAddr,
+    ) -> impl Future<Output = io::Result<()>> + 'a + Send {
+        async move {
+            let sent = self.socket.send(packet).await?;
+            if sent == packet.len() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UDP socket sent a partial datagram",
+                ))
+            }
+        }
     }
-    Ok(())
+}
+
+impl UdpProxiReceiver for ConnectedUdpEndpoint {
+    fn recv<'a>(
+        &'a self,
+        buff: &'a mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a + Send {
+        async move {
+            let len = self.socket.recv(buff).await?;
+            let peer = self.socket.peer_addr()?;
+            Ok((len, peer))
+        }
+    }
+}
+
+impl UdpProxiSender for UdpResponseSink {
+    fn send<'a>(
+        &'a self,
+        packet: &'a [u8],
+        _from: SocketAddr,
+        to: SocketAddr,
+    ) -> impl Future<Output = io::Result<()>> + 'a + Send {
+        async move {
+            let Some(socket) = self.socket.upgrade() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UDP listener closed",
+                ));
+            };
+
+            let sent = socket.send_to(packet, to).await?;
+            if sent == packet.len() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UDP socket sent a partial datagram",
+                ))
+            }
+        }
+    }
 }
 
 fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
@@ -583,404 +583,6 @@ fn configure_udp_socket(socket: &UdpSocket) -> io::Result<()> {
             UDP_SOCKET_BUFFER_SIZE,
             UDP_SOCKET_BUFFER_SIZE,
         )?;
-    }
-
-    Ok(())
-}
-
-async fn handle_tcp_connection_copy(
-    mut inbound: TcpStream,
-    mut outbound: TcpStream,
-    mut stop_rx: watch::Receiver<bool>,
-) -> AppResult<()> {
-    tokio::select! {
-        result = copy_bidirectional_with_sizes(
-            &mut inbound,
-            &mut outbound,
-            TCP_COPY_BUFFER_SIZE,
-            TCP_COPY_BUFFER_SIZE,
-        ) => {
-            result?;
-        }
-        _ = wait_for_shutdown(&mut stop_rx) => {}
-    }
-
-    Ok(())
-}
-
-async fn run_udp_tunnel(
-    spec: TunnelConfig,
-    listener: Arc<UdpSocket>,
-    mut stop_rx: watch::Receiver<bool>,
-) -> AppResult<()> {
-    let mut sessions = HashMap::<std::net::SocketAddr, UdpSession>::new();
-    let tunnel_name = spec.name.clone();
-    #[cfg(target_os = "linux")]
-    let mut batch = UdpRecvBatch::new(UDP_RECV_BATCH_SIZE);
-    #[cfg(not(target_os = "linux"))]
-    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_SIZE];
-    let mut cleanup_tick = interval(UDP_CLEANUP_INTERVAL);
-    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    cleanup_tick.tick().await;
-
-    let result: AppResult<()> = async {
-        loop {
-            tokio::select! {
-                readiness = listener.readable() => {
-                    if let Err(error) = readiness {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                        log_tunnel_worker_error("UDP", &tunnel_name, "listener readable", &error);
-                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
-                        continue;
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if let Err(error) = forward_udp_listener_batch(
-                        &listener,
-                        spec.target.as_str(),
-                        &mut sessions,
-                        &stop_rx,
-                        &mut batch,
-                    )
-                    .await
-                    {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                        log_tunnel_worker_error("UDP", &tunnel_name, "batch forward", error.as_ref());
-                        tokio::time::sleep(TUNNEL_ERROR_RETRY_DELAY).await;
-                        continue;
-                    }
-
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        for _ in 0..UDP_DRAIN_BURST {
-                            let (size, client_addr) = match listener.try_recv_from(&mut buffer) {
-                                Ok(result) => result,
-                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(error) => {
-                                    log_tunnel_worker_error("UDP", &tunnel_name, "recv_from", &error);
-                                    break;
-                                }
-                            };
-
-                            if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-                                match create_udp_session(
-                                    client_addr,
-                                    spec.target.clone(),
-                                    listener.clone(),
-                                    stop_rx.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(session) => {
-                                        entry.insert(session);
-                                    }
-                                    Err(error) => {
-                                        log_tunnel_worker_error(
-                                            "UDP",
-                                            &tunnel_name,
-                                            "create session",
-                                            error.as_ref(),
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let mut remove_session = false;
-                            if let Some(session) = sessions.get_mut(&client_addr) {
-                                session.last_seen = Instant::now();
-                                if let Err(error) =
-                                    send_udp_packet(session.upstream.as_ref(), &buffer[..size]).await
-                                {
-                                    log_tunnel_worker_error(
-                                        "UDP",
-                                        &tunnel_name,
-                                        "send to upstream",
-                                        &error,
-                                    );
-                                    remove_session = true;
-                                }
-                            }
-
-                            if remove_session
-                                && let Some(session) = sessions.remove(&client_addr)
-                            {
-                                retire_udp_session(session);
-                            }
-                        }
-                    }
-                }
-                _ = cleanup_tick.tick() => {
-                    retire_stale_udp_sessions(&mut sessions);
-                }
-                _ = wait_for_shutdown(&mut stop_rx) => {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-    .await;
-
-    shutdown_udp_sessions(sessions).await;
-
-    result
-}
-
-#[cfg(target_os = "linux")]
-async fn forward_udp_listener_batch(
-    listener: &Arc<UdpSocket>,
-    target: &str,
-    sessions: &mut HashMap<std::net::SocketAddr, UdpSession>,
-    global_stop_rx: &watch::Receiver<bool>,
-    batch: &mut UdpRecvBatch,
-) -> AppResult<()> {
-    let received = batch.recv(listener.as_ref().as_raw_fd())?;
-    if received == 0 {
-        return Ok(());
-    }
-
-    let mut grouped = Vec::<(std::net::SocketAddr, Vec<usize>)>::new();
-
-    for index in 0..received {
-        let client_addr = batch.client_addr(index)?;
-
-        if let Entry::Vacant(entry) = sessions.entry(client_addr) {
-            let session = create_udp_session(
-                client_addr,
-                target.to_string(),
-                listener.clone(),
-                global_stop_rx.clone(),
-            )
-            .await?;
-            entry.insert(session);
-        }
-
-        if let Some(session) = sessions.get_mut(&client_addr) {
-            session.last_seen = Instant::now();
-        }
-
-        if let Some((_, packet_indexes)) = grouped
-            .iter_mut()
-            .find(|(group_client_addr, _)| *group_client_addr == client_addr)
-        {
-            packet_indexes.push(index);
-        } else {
-            grouped.push((client_addr, vec![index]));
-        }
-    }
-
-    for (client_addr, packet_indexes) in grouped {
-        if let Some(session) = sessions.get(&client_addr) {
-            send_udp_batch_connected(session.upstream.as_ref(), batch, &packet_indexes).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn create_udp_session(
-    client_addr: std::net::SocketAddr,
-    target: String,
-    listener: Arc<UdpSocket>,
-    global_stop_rx: watch::Receiver<bool>,
-) -> AppResult<UdpSession> {
-    let upstream = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    configure_udp_socket(upstream.as_ref())?;
-    upstream.connect(&target).await?;
-
-    let (session_stop_tx, session_stop_rx) = watch::channel(false);
-    let session_upstream = upstream.clone();
-    let handle = tokio::spawn(async move {
-        if let Err(error) = pump_udp_responses(
-            listener,
-            session_upstream,
-            client_addr,
-            global_stop_rx,
-            session_stop_rx,
-        )
-        .await
-        {
-            eprintln!("UDP session handling failed: {}", error);
-        }
-    });
-
-    Ok(UdpSession {
-        upstream,
-        last_seen: Instant::now(),
-        stop_tx: session_stop_tx,
-        handle,
-    })
-}
-
-fn retire_stale_udp_sessions(sessions: &mut HashMap<std::net::SocketAddr, UdpSession>) {
-    let stale = sessions
-        .iter()
-        .filter_map(|(addr, session)| {
-            if session.last_seen.elapsed() > UDP_SESSION_IDLE_TIMEOUT {
-                Some(*addr)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for addr in stale {
-        if let Some(session) = sessions.remove(&addr) {
-            retire_udp_session(session);
-        }
-    }
-}
-
-fn retire_udp_session(session: UdpSession) {
-    let _ = session.stop_tx.send(true);
-    tokio::spawn(async move {
-        let _ = session.handle.await;
-    });
-}
-
-async fn shutdown_udp_sessions(sessions: HashMap<std::net::SocketAddr, UdpSession>) {
-    let mut handles = Vec::with_capacity(sessions.len());
-    for (_, session) in sessions {
-        let _ = session.stop_tx.send(true);
-        handles.push(session.handle);
-    }
-
-    for handle in handles {
-        wait_for_task_shutdown(handle, "UDP session worker").await;
-    }
-}
-
-async fn wait_for_task_shutdown(handle: JoinHandle<()>, label: &str) {
-    let mut handle = Box::pin(handle);
-    let abort_handle = handle.abort_handle();
-
-    match timeout(SHUTDOWN_GRACE_PERIOD, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            if !error.is_cancelled() {
-                eprintln!("{label} failed while stopping: {}", error);
-            }
-        }
-        Err(_) => {
-            eprintln!(
-                "Warning: {label} did not stop within {:?}; aborting it.",
-                SHUTDOWN_GRACE_PERIOD
-            );
-            abort_handle.abort();
-            if let Err(error) = handle.await
-                && !error.is_cancelled()
-            {
-                eprintln!("{label} failed after abort: {}", error);
-            }
-        }
-    }
-}
-
-async fn pump_udp_responses(
-    listener: Arc<UdpSocket>,
-    upstream: Arc<UdpSocket>,
-    client_addr: std::net::SocketAddr,
-    mut global_stop_rx: watch::Receiver<bool>,
-    mut session_stop_rx: watch::Receiver<bool>,
-) -> AppResult<()> {
-    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_SIZE];
-
-    loop {
-        tokio::select! {
-            readiness = upstream.readable() => {
-                readiness?;
-
-                for _ in 0..UDP_DRAIN_BURST {
-                    let size = match upstream.try_recv(&mut buffer) {
-                        Ok(size) => size,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error.into()),
-                    };
-
-                    send_udp_packet_to(listener.as_ref(), &buffer[..size], client_addr).await?;
-                }
-            }
-            _ = wait_for_shutdown(&mut global_stop_rx) => {
-                break;
-            }
-            _ = wait_for_shutdown(&mut session_stop_rx) => {
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn send_udp_packet(socket: &UdpSocket, payload: &[u8]) -> io::Result<()> {
-    loop {
-        match socket.try_send(payload) {
-            Ok(sent) if sent == payload.len() => return Ok(()),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "UDP socket sent a partial datagram",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => socket.writable().await?,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn send_udp_packet_to(
-    socket: &UdpSocket,
-    payload: &[u8],
-    target: std::net::SocketAddr,
-) -> io::Result<()> {
-    loop {
-        match socket.try_send_to(payload, target) {
-            Ok(sent) if sent == payload.len() => return Ok(()),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "UDP socket sent a partial datagram",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => socket.writable().await?,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn send_udp_batch_connected(
-    socket: &UdpSocket,
-    batch: &UdpRecvBatch,
-    packet_indexes: &[usize],
-) -> io::Result<()> {
-    let mut start = 0;
-    while start < packet_indexes.len() {
-        socket.writable().await?;
-        let payloads = packet_indexes[start..]
-            .iter()
-            .map(|index| batch.payload(*index))
-            .collect::<Vec<_>>();
-        match sendmmsg_connected_raw(socket.as_raw_fd(), &payloads) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "sendmmsg returned zero datagrams for a connected UDP socket",
-                ));
-            }
-            Ok(sent) => start += sent,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(error),
-        }
     }
 
     Ok(())
@@ -999,30 +601,6 @@ fn tune_socket_buffers(
 
 #[cfg(not(unix))]
 fn tune_socket_buffers(_fd: i32, _recv_bytes: i32, _send_bytes: i32) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn tune_tcp_keepalive(fd: libc::c_int) -> io::Result<()> {
-    set_socket_option(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-
-    #[cfg(target_os = "linux")]
-    {
-        set_socket_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SECS)?;
-        set_socket_option(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPINTVL,
-            TCP_KEEPALIVE_INTERVAL_SECS,
-        )?;
-        set_socket_option(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, TCP_KEEPALIVE_PROBES)?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn tune_tcp_keepalive(_fd: i32) -> io::Result<()> {
     Ok(())
 }
 
@@ -1050,185 +628,29 @@ fn set_socket_option(
     }
 }
 
-#[cfg(target_os = "linux")]
-struct UdpRecvBatch {
-    payloads: Vec<Vec<u8>>,
-    addresses: Vec<libc::sockaddr_storage>,
-    address_lengths: Vec<libc::socklen_t>,
-    payload_lengths: Vec<usize>,
-}
+async fn wait_for_task_shutdown(handle: JoinHandle<()>, label: &str) {
+    let mut handle = Box::pin(handle);
+    let abort_handle = handle.abort_handle();
 
-#[cfg(target_os = "linux")]
-impl UdpRecvBatch {
-    fn new(size: usize) -> Self {
-        let payloads = (0..size)
-            .map(|_| vec![0_u8; UDP_PACKET_BUFFER_SIZE])
-            .collect::<Vec<_>>();
-        let addresses = (0..size)
-            .map(|_| unsafe { std::mem::zeroed::<libc::sockaddr_storage>() })
-            .collect::<Vec<_>>();
-        let address_lengths = vec![0; size];
-        let payload_lengths = vec![0; size];
-
-        Self {
-            payloads,
-            addresses,
-            address_lengths,
-            payload_lengths,
-        }
-    }
-
-    fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
-        let mut iovecs = (0..self.payloads.len())
-            .map(|_| unsafe { std::mem::zeroed::<libc::iovec>() })
-            .collect::<Vec<_>>();
-        let mut messages = (0..self.payloads.len())
-            .map(|_| unsafe { std::mem::zeroed::<libc::mmsghdr>() })
-            .collect::<Vec<_>>();
-
-        for index in 0..self.payloads.len() {
-            self.addresses[index] = unsafe { std::mem::zeroed() };
-            self.address_lengths[index] = 0;
-            self.payload_lengths[index] = 0;
-            iovecs[index] = libc::iovec {
-                iov_base: self.payloads[index].as_mut_ptr().cast(),
-                iov_len: self.payloads[index].len(),
-            };
-            messages[index] = libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: (&mut self.addresses[index] as *mut libc::sockaddr_storage).cast(),
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-                    msg_iov: (&mut iovecs[index] as *mut libc::iovec).cast(),
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            };
-        }
-
-        loop {
-            let result = unsafe {
-                libc::recvmmsg(
-                    fd,
-                    messages.as_mut_ptr(),
-                    messages.len() as u32,
-                    libc::MSG_DONTWAIT,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if result >= 0 {
-                let received = result as usize;
-                for (index, message) in messages.iter().enumerate().take(received) {
-                    self.address_lengths[index] = message.msg_hdr.msg_namelen;
-                    self.payload_lengths[index] = message.msg_len as usize;
-                }
-                return Ok(received);
-            }
-
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(0),
-                _ => return Err(error),
+    match timeout(SHUTDOWN_GRACE_PERIOD, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !error.is_cancelled() {
+                eprintln!("{label} failed while stopping: {}", error);
             }
         }
-    }
-
-    fn payload(&self, index: usize) -> &[u8] {
-        &self.payloads[index][..self.payload_lengths[index]]
-    }
-
-    fn client_addr(&self, index: usize) -> io::Result<std::net::SocketAddr> {
-        socket_addr_from_storage(&self.addresses[index], self.address_lengths[index])
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sendmmsg_connected_raw(fd: RawFd, payloads: &[&[u8]]) -> io::Result<usize> {
-    let mut iovecs = payloads
-        .iter()
-        .map(|payload| libc::iovec {
-            iov_base: payload.as_ptr().cast_mut().cast(),
-            iov_len: payload.len(),
-        })
-        .collect::<Vec<_>>();
-    let mut messages = iovecs
-        .iter_mut()
-        .map(|iov| libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: (iov as *mut libc::iovec).cast(),
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        })
-        .collect::<Vec<_>>();
-
-    loop {
-        let result = unsafe {
-            libc::sendmmsg(
-                fd,
-                messages.as_mut_ptr(),
-                messages.len() as u32,
-                libc::MSG_DONTWAIT,
-            )
-        };
-
-        if result >= 0 {
-            return Ok(result as usize);
+        Err(_) => {
+            eprintln!(
+                "Warning: {label} did not stop within {:?}; aborting it.",
+                SHUTDOWN_GRACE_PERIOD
+            );
+            abort_handle.abort();
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                eprintln!("{label} failed after abort: {}", error);
+            }
         }
-
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-
-        return Err(error);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn socket_addr_from_storage(
-    storage: &libc::sockaddr_storage,
-    name_len: libc::socklen_t,
-) -> io::Result<std::net::SocketAddr> {
-    if name_len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing UDP peer address from recvmmsg",
-        ));
-    }
-
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            let addr =
-                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
-            Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
-                u16::from_be(addr.sin_port),
-            )))
-        }
-        libc::AF_INET6 => {
-            let addr =
-                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
-            Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
-                u16::from_be(addr.sin6_port),
-                addr.sin6_flowinfo,
-                addr.sin6_scope_id,
-            )))
-        }
-        family => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported UDP socket family: {}", family),
-        )),
     }
 }
 

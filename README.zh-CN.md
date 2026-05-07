@@ -189,7 +189,7 @@ Action [a/e/t/d/m/l/s/q]:
 - TCP 转发在 Tokio 支持的平台上都能工作
 - `socket` 模式在 Linux、macOS、Windows 下都使用同一套用户态 TCP 转发路径
 - `nft` 模式仅在 Linux 下可用
-- UDP 转发目前是用户态实现（在 Linux 下有基于 recvmmsg/sendmmsg 的批量收发优化）
+- UDP 转发目前是用户态实现
 
 ## 开发
 

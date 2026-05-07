@@ -1,13 +1,10 @@
-use std::sync::Arc;
-
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, sleep};
 
 use super::super::*;
 use super::helpers::{
-    TcpDropFirstServer, TcpEchoServer, TcpHalfOpenServer, UdpEchoServer,
+    TcpDropFirstServer, TcpEchoServer, UdpEchoServer,
     assert_socket_closes_without_forwarding, assert_tcp_round_trip, assert_udp_round_trip,
     reserve_tcp_addr, reserve_udp_addr, tcp_tunnel_spec, udp_tunnel_spec,
 };
@@ -108,6 +105,34 @@ async fn tcp_tunnel_survives_abrupt_client_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_tunnel_handles_multiple_parallel_connections() {
+    let backend = TcpEchoServer::spawn().await;
+    let listen = reserve_tcp_addr();
+
+    let mut manager = TunnelManager::default();
+    assert!(
+        manager
+            .reconcile(vec![tcp_tunnel_spec("parallel", listen, backend.addr,)])
+            .await
+    );
+
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        tasks.push(tokio::spawn(async move {
+            let payload = format!("parallel-{index}").into_bytes();
+            assert_tcp_round_trip(listen, &payload).await;
+        }));
+    }
+
+    for task in tasks {
+        task.await.expect("parallel tunnel task should succeed");
+    }
+
+    manager.stop_all().await;
+    backend.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_tunnel_recovers_after_upstream_drops_one_connection() {
     let backend = TcpDropFirstServer::spawn().await;
     let listen = reserve_tcp_addr();
@@ -133,178 +158,6 @@ async fn tcp_tunnel_recovers_after_upstream_drops_one_connection() {
     assert_tcp_round_trip(listen, b"after-upstream-drop").await;
 
     manager.stop_all().await;
-    backend.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_tunnel_closes_excess_connections_until_capacity_is_available() {
-    let backend = TcpEchoServer::spawn().await;
-    let listen = reserve_tcp_addr();
-    let spec = tcp_tunnel_spec("drop-over-capacity", listen, backend.addr);
-    let listener = TcpListener::bind(listen)
-        .await
-        .expect("drop-over-capacity tunnel should bind a TCP listener");
-    let limiter = Arc::new(Semaphore::new(1));
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let tunnel = tokio::spawn(run_tcp_tunnel_with_limiter(
-        spec, listener, stop_rx, limiter, 1,
-    ));
-
-    let first_stream = TcpStream::connect(listen)
-        .await
-        .expect("first client should connect while capacity is available");
-    sleep(Duration::from_millis(50)).await;
-
-    let mut excess_stream = TcpStream::connect(listen)
-        .await
-        .expect("excess client should complete the TCP handshake");
-    let _ = excess_stream.write_all(b"excess").await;
-    assert_socket_closes_without_forwarding(excess_stream).await;
-
-    drop(first_stream);
-    sleep(Duration::from_millis(100)).await;
-    assert_tcp_round_trip(listen, b"after-capacity-release").await;
-
-    let _ = stop_tx.send(true);
-    tunnel
-        .await
-        .expect("drop-over-capacity tunnel task should join")
-        .expect("drop-over-capacity tunnel should stop cleanly");
-    backend.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_global_capacity_saturation_drops_excess_connections_without_blocking_recovery() {
-    let blocking_backend = TcpHalfOpenServer::spawn(Duration::from_millis(250)).await;
-    let echo_backend = TcpEchoServer::spawn().await;
-    let blocking_listen = reserve_tcp_addr();
-    let echo_listen = reserve_tcp_addr();
-    let limiter = Arc::new(Semaphore::new(1));
-    let (stop_tx, stop_rx) = watch::channel(false);
-
-    let blocking_tunnel = tokio::spawn(run_tcp_tunnel_with_limiter(
-        tcp_tunnel_spec("global-blocker", blocking_listen, blocking_backend.addr),
-        TcpListener::bind(blocking_listen)
-            .await
-            .expect("blocking tunnel should bind a TCP listener"),
-        stop_rx.clone(),
-        limiter.clone(),
-        1,
-    ));
-    let echo_tunnel = tokio::spawn(run_tcp_tunnel_with_limiter(
-        tcp_tunnel_spec("global-echo", echo_listen, echo_backend.addr),
-        TcpListener::bind(echo_listen)
-            .await
-            .expect("echo tunnel should bind a TCP listener"),
-        stop_rx,
-        limiter,
-        1,
-    ));
-
-    let blocking_client = TcpStream::connect(blocking_listen)
-        .await
-        .expect("blocking client should connect while capacity is available");
-
-    let mut saturated_echo_client = TcpStream::connect(echo_listen)
-        .await
-        .expect("echo client should complete the TCP handshake while saturated");
-    let _ = saturated_echo_client.write_all(b"cross-tunnel").await;
-    assert_socket_closes_without_forwarding(saturated_echo_client).await;
-
-    drop(blocking_client);
-    sleep(Duration::from_millis(350)).await;
-    assert_tcp_round_trip(echo_listen, b"cross-tunnel-recovered").await;
-
-    let _ = stop_tx.send(true);
-    blocking_tunnel
-        .await
-        .expect("blocking tunnel task should join")
-        .expect("blocking tunnel should stop cleanly");
-    echo_tunnel
-        .await
-        .expect("echo tunnel task should join")
-        .expect("echo tunnel should stop cleanly");
-    blocking_backend.stop().await;
-    echo_backend.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_tunnel_recovers_when_started_while_global_capacity_is_exhausted() {
-    let backend = TcpEchoServer::spawn().await;
-    let listen = reserve_tcp_addr();
-    let limiter = Arc::new(Semaphore::new(1));
-    let held_permit = limiter
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("test should reserve the only TCP permit");
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let tunnel = tokio::spawn(run_tcp_tunnel_with_limiter(
-        tcp_tunnel_spec("startup-overload", listen, backend.addr),
-        TcpListener::bind(listen)
-            .await
-            .expect("startup-overload tunnel should bind a TCP listener"),
-        stop_rx,
-        limiter,
-        1,
-    ));
-
-    sleep(Duration::from_millis(100)).await;
-
-    let mut overloaded_client = TcpStream::connect(listen)
-        .await
-        .expect("client should complete the TCP handshake");
-    let _ = overloaded_client.write_all(b"startup-overload").await;
-    assert_socket_closes_without_forwarding(overloaded_client).await;
-
-    drop(held_permit);
-    assert_tcp_round_trip(listen, b"startup-recovered").await;
-
-    let _ = stop_tx.send(true);
-    let _ = timeout(Duration::from_secs(1), tunnel).await;
-    backend.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_tunnel_stops_promptly_after_rejecting_connection_without_capacity() {
-    let backend = TcpEchoServer::spawn().await;
-    let listen = reserve_tcp_addr();
-    let limiter = Arc::new(Semaphore::new(1));
-    let held_permit = limiter
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("test should reserve the only TCP permit");
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let tunnel = tokio::spawn(run_tcp_tunnel_with_limiter(
-        tcp_tunnel_spec("stop-after-reject", listen, backend.addr),
-        TcpListener::bind(listen)
-            .await
-            .expect("stop-after-reject tunnel should bind a TCP listener"),
-        stop_rx,
-        limiter,
-        1,
-    ));
-
-    let mut stream = TcpStream::connect(listen)
-        .await
-        .expect("client should complete the TCP handshake before shutdown");
-    stream
-        .write_all(b"stop-me")
-        .await
-        .expect("client should write before tunnel shutdown");
-
-    sleep(Duration::from_millis(100)).await;
-    let _ = stop_tx.send(true);
-
-    timeout(Duration::from_secs(1), tunnel)
-        .await
-        .expect("tunnel should stop promptly after rejecting over-capacity connections")
-        .expect("blocked tunnel task should join")
-        .expect("blocked tunnel should stop cleanly");
-
-    drop(held_permit);
-    assert_socket_closes_without_forwarding(stream).await;
     backend.stop().await;
 }
 
