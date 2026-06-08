@@ -134,8 +134,9 @@ tunnels:
 
 - Linux 且系统中可用 `nft` 命令
 - 拥有修改 nftables 的权限
-- 每个启用的 tunnel 都必须使用明确的 IPv4 `listen` 地址
+- 每个启用的 tunnel 都必须使用 IPv4 `listen` 地址；`0.0.0.0:PORT` 会匹配本机 IPv4 地址
 - `target` 也必须是 IPv4
+- `127.0.0.1:8080` 这类 loopback target 必须搭配明确的 loopback `listen` 地址
 
 ## 运行时行为
 

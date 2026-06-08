@@ -140,8 +140,9 @@ tunnels:
 
 - Linux with the `nft` command available
 - Sufficient privileges to modify nftables
-- Each enabled tunnel must use an explicit IPv4 listen address
+- Each enabled tunnel must use an IPv4 `listen` address; `0.0.0.0:PORT` matches local IPv4 addresses
 - `target` must also be IPv4
+- Loopback targets such as `127.0.0.1:8080` require an explicit loopback `listen` address
 
 ## Runtime Behavior
 
