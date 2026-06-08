@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -151,7 +151,7 @@ impl ActiveTunnel {
             }
 
             if spec.protocol.supports_udp() {
-                let udp_target = parse_socket_addr(&spec.target, "target")?;
+                let udp_target = resolve_socket_addr(&spec.target, "target").await?;
                 let udp_listener = Arc::new(UdpSocket::bind(&spec.listen).await?);
                 configure_udp_socket(udp_listener.as_ref())?;
                 let udp_name = spec.name.clone();
@@ -324,11 +324,21 @@ async fn build_tcp_listener(listen: &str) -> AppResult<TcpListener> {
     Ok(TcpListener::bind(listen).await?)
 }
 
-fn parse_socket_addr(value: &str, label: &str) -> AppResult<SocketAddr> {
-    value.parse::<SocketAddr>().map_err(|error| {
+async fn resolve_socket_addr(value: &str, label: &str) -> AppResult<SocketAddr> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let mut addrs = lookup_host(value).await.map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid {label} address {value}: {error}"),
+            format!("Failed to resolve {label} address {value}: {error}"),
+        )
+    })?;
+    addrs.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Failed to resolve {label} address {value}: no addresses found"),
         )
         .into()
     })

@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::io::{self, Write};
 #[cfg(target_os = "linux")]
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
@@ -149,7 +149,7 @@ impl NftRuleset {
 
         for tunnel in tunnels {
             let listen = tunnel.listen.parse::<SocketAddr>()?;
-            let target = tunnel.target.parse::<SocketAddr>()?;
+            let target_v4 = resolve_ipv4_target(&tunnel.target)?;
 
             let SocketAddr::V4(listen_v4) = listen else {
                 return Err(io::Error::new(
@@ -157,16 +157,6 @@ impl NftRuleset {
                     format!(
                         "nft mode only supports IPv4 listen addresses: {}",
                         tunnel.listen
-                    ),
-                )
-                .into());
-            };
-            let SocketAddr::V4(target_v4) = target else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "nft mode only supports IPv4 target addresses: {}",
-                        tunnel.target
                     ),
                 )
                 .into());
@@ -289,6 +279,40 @@ impl NftRuleset {
 
         script
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_ipv4_target(value: &str) -> AppResult<SocketAddrV4> {
+    if let Ok(SocketAddr::V4(addr)) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if value.parse::<SocketAddr>().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("nft mode only supports IPv4 target addresses: {value}"),
+        )
+        .into());
+    }
+
+    value
+        .to_socket_addrs()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Failed to resolve nft target address {value}: {error}"),
+            )
+        })?
+        .find_map(|addr| match addr {
+            SocketAddr::V4(addr) => Some(addr),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("nft mode target must resolve to an IPv4 address: {value}"),
+            )
+            .into()
+        })
 }
 
 #[cfg(target_os = "linux")]

@@ -6,47 +6,45 @@ use crate::config::{AppConfig, AppMode, Protocol, TunnelConfig};
 
 pub fn manage_config(path: &Path) -> AppResult<()> {
     let mut config = AppConfig::load_or_default(path)?;
-    let mut dirty = false;
 
     loop {
-        render_dashboard(path, &config, dirty);
+        render_dashboard(path, &config);
 
-        match prompt("Action [a/e/t/d/m/l/s/q]")?
+        let changed = match prompt("Action [a/e/t/d/m/l/q]")?
             .trim()
             .to_ascii_lowercase()
             .as_str()
         {
-            "a" | "add" => dirty |= add_tunnel(&mut config)?,
-            "e" | "edit" => dirty |= edit_tunnel(&mut config)?,
-            "t" | "toggle" => dirty |= toggle_tunnel(&mut config)?,
-            "d" | "delete" => dirty |= delete_tunnel(&mut config)?,
-            "m" | "mode" => dirty |= toggle_mode(&mut config),
-            "l" | "log" => dirty |= toggle_daemon_log(&mut config),
-            "s" | "save" => {
-                config.save(path)?;
-                println!("Saved configuration to {}.", path.display());
-                return Ok(());
-            }
+            "a" | "add" => add_tunnel(&mut config)?,
+            "e" | "edit" => edit_tunnel(&mut config)?,
+            "t" | "toggle" => toggle_tunnel(&mut config)?,
+            "d" | "delete" => delete_tunnel(&mut config)?,
+            "m" | "mode" => toggle_mode(&mut config),
+            "l" | "log" => toggle_daemon_log(&mut config),
             "q" | "quit" => {
-                if dirty && !prompt_bool("Discard unsaved changes? [y/N]", false)? {
-                    println!("Nothing was discarded.");
-                    continue;
-                }
                 println!("Exited configuration editor.");
                 return Ok(());
             }
-            "" => {}
-            _ => println!("Unknown action. Use a, e, t, d, m, l, s, or q."),
+            "" => false,
+            _ => {
+                println!("Unknown action. Use a, e, t, d, m, l, or q.");
+                false
+            }
+        };
+
+        if changed {
+            config.save(path)?;
+            println!("Saved configuration to {}.", path.display());
         }
     }
 }
 
-fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
+fn render_dashboard(path: &Path, config: &AppConfig) {
     println!();
     println!("Config editor");
     println!("File: {}", path.display());
     println!(
-        "Tunnels: {} total, {} enabled, {} disabled{}",
+        "Tunnels: {} total, {} enabled, {} disabled",
         config.tunnels.len(),
         config
             .tunnels
@@ -57,8 +55,7 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
             .tunnels
             .iter()
             .filter(|tunnel| !tunnel.enabled)
-            .count(),
-        if dirty { " | unsaved changes" } else { "" }
+            .count()
     );
     println!(
         "Forwarding mode: {}",
@@ -110,7 +107,6 @@ fn render_dashboard(path: &Path, config: &AppConfig, dirty: bool) {
     println!("  d = delete tunnel");
     println!("  m = toggle forwarding mode (socket/nft)");
     println!("  l = toggle daemon log file");
-    println!("  s = save and exit");
     println!("  q = quit");
     println!();
 }
@@ -121,16 +117,15 @@ fn add_tunnel(config: &mut AppConfig) -> AppResult<bool> {
 
     let name = prompt_new_name(config, None)?;
     let protocol = prompt_protocol(None)?;
-    let target = prompt_socket_addr("Remote target address (host:port)", None)?;
+    let target = prompt_target_addr("Remote target address (host:port)", None)?;
     let listen = prompt_socket_addr("Local listen address (host:port)", None)?;
-    let enabled = prompt_bool("Enable this tunnel now? [Y/n]", true)?;
 
     let tunnel = TunnelConfig {
         name,
         protocol,
         target,
         listen,
-        enabled,
+        enabled: true,
     };
     tunnel.validate()?;
 
@@ -159,7 +154,7 @@ fn edit_tunnel(config: &mut AppConfig) -> AppResult<bool> {
 
     tunnel.name = prompt_new_name(config, Some(index))?;
     tunnel.protocol = prompt_protocol(Some(tunnel.protocol))?;
-    tunnel.target = prompt_socket_addr("Remote target address", Some(tunnel.target.as_str()))?;
+    tunnel.target = prompt_target_addr("Remote target address", Some(tunnel.target.as_str()))?;
     tunnel.listen = prompt_socket_addr("Local listen address", Some(tunnel.listen.as_str()))?;
     tunnel.enabled = prompt_bool(
         if tunnel.enabled {
@@ -352,6 +347,33 @@ fn prompt_socket_addr(label: &str, current: Option<&str>) -> AppResult<String> {
             Err(error) => println!("Invalid address format: {}", error),
         }
     }
+}
+
+fn prompt_target_addr(label: &str, current: Option<&str>) -> AppResult<String> {
+    loop {
+        let input = prompt_optional(label, current)?;
+        let value = input.trim();
+        if value.is_empty() {
+            if let Some(existing) = current {
+                return Ok(existing.to_string());
+            }
+            println!("Address cannot be empty.");
+            continue;
+        }
+
+        if value.parse::<std::net::SocketAddr>().is_ok() || target_host_port_is_valid(value) {
+            return Ok(value.to_string());
+        }
+
+        println!("Invalid address format. Use host:port.");
+    }
+}
+
+fn target_host_port_is_valid(value: &str) -> bool {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    !host.trim().is_empty() && !host.contains(':') && port.parse::<u16>().is_ok()
 }
 
 fn prompt_bool(label: &str, default: bool) -> AppResult<bool> {

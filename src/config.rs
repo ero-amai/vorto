@@ -198,15 +198,23 @@ impl AppConfig {
                             format!("Invalid listen address {}: {}", tunnel.listen, error),
                         )
                     })?;
-                let target = tunnel
-                    .target
-                    .parse::<std::net::SocketAddr>()
-                    .map_err(|error| {
-                        io::Error::new(
+                let target_v4 = match tunnel.target.parse::<std::net::SocketAddr>() {
+                    Ok(std::net::SocketAddr::V4(addr)) => Some(addr),
+                    Ok(std::net::SocketAddr::V6(_)) => {
+                        return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("Invalid target address {}: {}", tunnel.target, error),
+                            format!(
+                                "nft mode only supports IPv4 target addresses: {}",
+                                tunnel.target
+                            ),
                         )
-                    })?;
+                        .into());
+                    }
+                    Err(_) => {
+                        validate_host_port(&tunnel.target, "target")?;
+                        None
+                    }
+                };
 
                 let std::net::SocketAddr::V4(listen_v4) = listen else {
                     return Err(io::Error::new(
@@ -218,18 +226,7 @@ impl AppConfig {
                     )
                     .into());
                 };
-                let std::net::SocketAddr::V4(target_v4) = target else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "nft mode only supports IPv4 target addresses: {}",
-                            tunnel.target
-                        ),
-                    )
-                    .into());
-                };
-
-                if target_v4.ip().is_loopback()
+                if target_v4.is_some_and(|target| target.ip().is_loopback())
                     && (listen_v4.ip().is_unspecified() || !listen_v4.ip().is_loopback())
                 {
                     return Err(io::Error::new(
@@ -315,15 +312,43 @@ impl TunnelConfig {
 
         self.target
             .parse::<std::net::SocketAddr>()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Invalid target address {}: {}", self.target, error),
-                )
-            })?;
+            .map(|_| ())
+            .or_else(|_| validate_host_port(&self.target, "target"))?;
 
         Ok(())
     }
+}
+
+fn validate_host_port(value: &str, label: &str) -> io::Result<()> {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid {label} address {value}: expected host:port"),
+        ));
+    };
+
+    if host.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid {label} address {value}: host cannot be empty"),
+        ));
+    }
+
+    if host.contains(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid {label} address {value}: IPv6 addresses must use [addr]:port"),
+        ));
+    }
+
+    port.parse::<u16>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid {label} address {value}: invalid port: {error}"),
+        )
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -403,6 +428,15 @@ mod tests {
     fn parse_defaults_mode_to_socket() {
         let config = AppConfig::parse("tunnels: []\n").expect("default mode should parse");
         assert_eq!(config.mode, AppMode::Socket);
+    }
+
+    #[test]
+    fn parse_accepts_hostname_target() {
+        let config = AppConfig::parse(
+            "tunnels:\n  - name: host\n    listen: 0.0.0.0:22704\n    target: hkt.arsfy.top:22704\n    protocol: tcp\n",
+        )
+        .expect("hostname target should parse");
+        assert_eq!(config.tunnels[0].target, "hkt.arsfy.top:22704");
     }
 
     #[cfg(target_os = "linux")]
