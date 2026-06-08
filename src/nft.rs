@@ -1,13 +1,22 @@
-use std::collections::HashSet;
-use std::fmt::Write as _;
-use std::io::{self, Write};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::AppResult;
 use crate::config::TunnelConfig;
 
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
+#[cfg(target_os = "linux")]
+use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+
+#[cfg(target_os = "linux")]
+use crate::AppResult;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct NftManager {
     names: NftNames,
     active_specs: Vec<TunnelConfig>,
@@ -95,12 +104,14 @@ impl Drop for NftManager {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct NftNames {
     table: String,
     prerouting_chain: String,
     output_chain: String,
     postrouting_chain: String,
     target_set: String,
+    mark: u32,
 }
 
 impl NftNames {
@@ -118,6 +129,7 @@ impl NftNames {
             output_chain: format!("vorto_out_{suffix}"),
             postrouting_chain: format!("vorto_post_{suffix}"),
             target_set: format!("vorto_targets_{suffix}"),
+            mark: 0x7600_0000 | (((pid as u128) ^ unique) as u32 & 0x00ff_ffff),
         }
     }
 }
@@ -160,12 +172,14 @@ impl NftRuleset {
                 .into());
             };
 
-            if listen_v4.ip().is_unspecified() {
+            if target_v4.ip().is_loopback()
+                && (listen_v4.ip().is_unspecified() || !listen_v4.ip().is_loopback())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "nft mode requires a specific IPv4 listen address, not {}",
-                        tunnel.listen
+                        "nft mode can only target loopback addresses from explicit loopback listen addresses: {} -> {}",
+                        tunnel.listen, tunnel.target
                     ),
                 )
                 .into());
@@ -173,7 +187,7 @@ impl NftRuleset {
 
             if tunnel.protocol.supports_tcp() {
                 rules.push(NftRule::Tcp {
-                    listen_ip: *listen_v4.ip(),
+                    listen_ip: (!listen_v4.ip().is_unspecified()).then_some(*listen_v4.ip()),
                     listen_port: listen_v4.port(),
                     target_ip: *target_v4.ip(),
                     target_port: target_v4.port(),
@@ -182,7 +196,7 @@ impl NftRuleset {
 
             if tunnel.protocol.supports_udp() {
                 rules.push(NftRule::Udp {
-                    listen_ip: *listen_v4.ip(),
+                    listen_ip: (!listen_v4.ip().is_unspecified()).then_some(*listen_v4.ip()),
                     listen_port: listen_v4.port(),
                     target_ip: *target_v4.ip(),
                     target_port: target_v4.port(),
@@ -249,17 +263,26 @@ impl NftRuleset {
 
             writeln!(
                 &mut script,
-                "add rule ip {} {} ip daddr @{} masquerade",
-                self.names.table, self.names.postrouting_chain, self.names.target_set
+                "add rule ip {} {} meta mark 0x{:x} ip daddr @{} masquerade",
+                self.names.table,
+                self.names.postrouting_chain,
+                self.names.mark,
+                self.names.target_set
             )
             .unwrap();
         }
 
         for rule in &self.rules {
-            for rendered in rule.render(&self.names.table, &self.names.prerouting_chain) {
+            for rendered in rule.render(
+                &self.names.table,
+                &self.names.prerouting_chain,
+                self.names.mark,
+            ) {
                 writeln!(&mut script, "{rendered}").unwrap();
             }
-            for rendered in rule.render(&self.names.table, &self.names.output_chain) {
+            for rendered in
+                rule.render(&self.names.table, &self.names.output_chain, self.names.mark)
+            {
                 writeln!(&mut script, "{rendered}").unwrap();
             }
         }
@@ -271,13 +294,13 @@ impl NftRuleset {
 #[cfg(target_os = "linux")]
 enum NftRule {
     Tcp {
-        listen_ip: Ipv4Addr,
+        listen_ip: Option<Ipv4Addr>,
         listen_port: u16,
         target_ip: Ipv4Addr,
         target_port: u16,
     },
     Udp {
-        listen_ip: Ipv4Addr,
+        listen_ip: Option<Ipv4Addr>,
         listen_port: u16,
         target_ip: Ipv4Addr,
         target_port: u16,
@@ -286,7 +309,7 @@ enum NftRule {
 
 #[cfg(target_os = "linux")]
 impl NftRule {
-    fn render(&self, table: &str, chain: &str) -> Vec<String> {
+    fn render(&self, table: &str, chain: &str, mark: u32) -> Vec<String> {
         match self {
             Self::Tcp {
                 listen_ip,
@@ -294,7 +317,8 @@ impl NftRule {
                 target_ip,
                 target_port,
             } => vec![format!(
-                "add rule ip {table} {chain} ip daddr {listen_ip} tcp dport {listen_port} dnat to {target_ip}:{target_port}"
+                "add rule ip {table} {chain} {} meta mark set 0x{mark:x} dnat to {target_ip}:{target_port}",
+                listen_match("tcp", *listen_ip, *listen_port)
             )],
             Self::Udp {
                 listen_ip,
@@ -302,9 +326,18 @@ impl NftRule {
                 target_ip,
                 target_port,
             } => vec![format!(
-                "add rule ip {table} {chain} ip daddr {listen_ip} udp dport {listen_port} dnat to {target_ip}:{target_port}"
+                "add rule ip {table} {chain} {} meta mark set 0x{mark:x} dnat to {target_ip}:{target_port}",
+                listen_match("udp", *listen_ip, *listen_port)
             )],
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn listen_match(protocol: &str, listen_ip: Option<Ipv4Addr>, listen_port: u16) -> String {
+    match listen_ip {
+        Some(listen_ip) => format!("ip daddr {listen_ip} {protocol} dport {listen_port}"),
+        None => format!("fib daddr type local {protocol} dport {listen_port}"),
     }
 }
 
@@ -376,13 +409,13 @@ mod tests {
             names: names.clone(),
             rules: vec![
                 NftRule::Tcp {
-                    listen_ip: Ipv4Addr::new(127, 0, 0, 1),
+                    listen_ip: Some(Ipv4Addr::new(127, 0, 0, 1)),
                     listen_port: 8080,
                     target_ip: Ipv4Addr::new(10, 0, 0, 2),
                     target_port: 80,
                 },
                 NftRule::Udp {
-                    listen_ip: Ipv4Addr::new(127, 0, 0, 1),
+                    listen_ip: None,
                     listen_port: 5353,
                     target_ip: Ipv4Addr::new(1, 1, 1, 1),
                     target_port: 53,
@@ -393,9 +426,46 @@ mod tests {
 
         let script = ruleset.render_script();
         assert!(script.contains(&format!("add table ip {}", names.table)));
-        assert!(script.contains("tcp dport 8080 dnat to 10.0.0.2:80"));
-        assert!(script.contains("udp dport 5353 dnat to 1.1.1.1:53"));
+        assert!(script.contains(&format!(
+            "tcp dport 8080 meta mark set 0x{:x} dnat to 10.0.0.2:80",
+            names.mark
+        )));
+        assert!(script.contains(&format!(
+            "udp dport 5353 meta mark set 0x{:x} dnat to 1.1.1.1:53",
+            names.mark
+        )));
+        assert!(script.contains("fib daddr type local udp dport 5353"));
         assert!(script.contains(&names.target_set));
+        assert!(script.contains(&format!(
+            "meta mark 0x{:x} ip daddr @{} masquerade",
+            names.mark, names.target_set
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_ruleset_does_not_masquerade_unmarked_traffic_to_target_ip() {
+        let names = NftNames::new();
+        let tunnel = TunnelConfig {
+            name: "remote".to_string(),
+            listen: "127.0.0.1:8080".to_string(),
+            target: "10.0.0.2:80".to_string(),
+            protocol: crate::config::Protocol::Tcp,
+            enabled: true,
+        };
+
+        let script = NftRuleset::from_tunnels(&[tunnel], &names)
+            .expect("ruleset should render")
+            .render_script();
+
+        assert!(!script.contains(&format!(
+            "add rule ip {} {} ip daddr @{} masquerade",
+            names.table, names.postrouting_chain, names.target_set
+        )));
+        assert!(script.contains(&format!(
+            "add rule ip {} {} meta mark 0x{:x} ip daddr @{} masquerade",
+            names.table, names.postrouting_chain, names.mark, names.target_set
+        )));
     }
 
     #[cfg(target_os = "linux")]

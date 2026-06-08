@@ -176,17 +176,17 @@ impl AppConfig {
     fn validate_nft_mode(&self) -> AppResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "nft mode is only supported on Linux.",
             )
-            .into());
+            .into())
         }
 
         #[cfg(target_os = "linux")]
         {
-            let mut tcp_listens = HashSet::new();
-            let mut udp_listens = HashSet::new();
+            let mut tcp_listens = Vec::new();
+            let mut udp_listens = Vec::new();
 
             for tunnel in self.enabled_tunnels() {
                 let listen = tunnel
@@ -229,45 +229,69 @@ impl AppConfig {
                     .into());
                 };
 
-                if listen_v4.ip().is_unspecified() {
+                if target_v4.ip().is_loopback()
+                    && (listen_v4.ip().is_unspecified() || !listen_v4.ip().is_loopback())
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "nft mode requires a specific IPv4 listen address, not {}",
-                            tunnel.listen
+                            "nft mode can only target loopback addresses from explicit loopback listen addresses: {} -> {}",
+                            tunnel.listen, tunnel.target
                         ),
                     )
                     .into());
                 }
 
-                let _ = target_v4;
-
-                let listen_key = (listen_v4.ip().to_string(), listen_v4.port());
-                if tunnel.protocol.supports_tcp() && !tcp_listens.insert(listen_key.clone()) {
+                let listen_key = (*listen_v4.ip(), listen_v4.port());
+                if tunnel.protocol.supports_tcp()
+                    && listen_endpoint_overlaps(&tcp_listens, listen_key)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "Duplicate TCP listen endpoint in nft mode: {}",
+                            "Duplicate or overlapping TCP listen endpoint in nft mode: {}",
                             tunnel.listen
                         ),
                     )
                     .into());
                 }
-                if tunnel.protocol.supports_udp() && !udp_listens.insert(listen_key) {
+                if tunnel.protocol.supports_tcp() {
+                    tcp_listens.push(listen_key);
+                }
+
+                if tunnel.protocol.supports_udp()
+                    && listen_endpoint_overlaps(&udp_listens, listen_key)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "Duplicate UDP listen endpoint in nft mode: {}",
+                            "Duplicate or overlapping UDP listen endpoint in nft mode: {}",
                             tunnel.listen
                         ),
                     )
                     .into());
+                }
+                if tunnel.protocol.supports_udp() {
+                    udp_listens.push(listen_key);
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn listen_endpoint_overlaps(
+    existing: &[(std::net::Ipv4Addr, u16)],
+    candidate: (std::net::Ipv4Addr, u16),
+) -> bool {
+    existing.iter().any(|existing| {
+        existing.1 == candidate.1
+            && (existing.0 == candidate.0
+                || existing.0.is_unspecified()
+                || candidate.0.is_unspecified())
+    })
 }
 
 impl TunnelConfig {
@@ -393,15 +417,49 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn nft_mode_rejects_unspecified_listen_address() {
-        let error = AppConfig::parse(
-            "mode: nft\ntunnels:\n  - name: nft\n    listen: 0.0.0.0:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+    fn nft_mode_accepts_unspecified_listen_address_to_non_loopback_target() {
+        let config = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: nft\n    listen: 0.0.0.0:443\n    target: 1.2.3.4:443\n    protocol: tcp\n",
         )
-        .expect_err("nft mode should reject unspecified listen addresses");
+        .expect("nft mode should accept unspecified listen addresses for non-loopback targets");
+        assert_eq!(config.mode, AppMode::Nft);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_mode_rejects_overlapping_unspecified_and_specific_listen_endpoints() {
+        let error = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: wildcard\n    listen: 0.0.0.0:443\n    target: 1.2.3.4:443\n    protocol: tcp\n  - name: loopback\n    listen: 127.0.0.1:443\n    target: 5.6.7.8:443\n    protocol: tcp\n",
+        )
+        .expect_err("nft mode should reject wildcard listens overlapping specific listens");
         assert!(
             error
                 .to_string()
-                .contains("requires a specific IPv4 listen address")
+                .contains("Duplicate or overlapping TCP listen endpoint")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_mode_rejects_non_loopback_listen_to_loopback_target() {
+        let error = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: nft\n    listen: 192.0.2.10:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+        )
+        .expect_err("nft mode should reject non-loopback listen addresses targeting loopback");
+        assert!(error.to_string().contains(
+            "can only target loopback addresses from explicit loopback listen addresses"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_mode_rejects_unspecified_listen_to_loopback_target() {
+        let error = AppConfig::parse(
+            "mode: nft\ntunnels:\n  - name: nft\n    listen: 0.0.0.0:18080\n    target: 127.0.0.1:8080\n    protocol: tcp\n",
+        )
+        .expect_err("nft mode should reject unspecified listen addresses targeting loopback");
+        assert!(error.to_string().contains(
+            "can only target loopback addresses from explicit loopback listen addresses"
+        ));
     }
 }
