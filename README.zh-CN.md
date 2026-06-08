@@ -80,10 +80,9 @@ Actions:
   d = delete tunnel
   m = toggle forwarding mode (socket/nft)
   l = toggle daemon log file
-  s = save and exit
   q = quit
 
-Action [a/e/t/d/m/l/s/q]:
+Action [a/e/t/d/m/l/q]:
 └─ 
 ```
 
@@ -135,7 +134,7 @@ tunnels:
 - Linux 且系统中可用 `nft` 命令
 - 拥有修改 nftables 的权限
 - 每个启用的 tunnel 都必须使用 IPv4 `listen` 地址；`0.0.0.0:PORT` 会匹配本机 IPv4 地址
-- `target` 也必须是 IPv4
+- `target` 必须是 IPv4 地址，或是在应用规则时能解析出 IPv4 的域名
 - `127.0.0.1:8080` 这类 loopback target 必须搭配明确的 loopback `listen` 地址
 
 ## 运行时行为
@@ -176,12 +175,12 @@ tunnels:
 - 删除 tunnel
 - 在 `socket` 和 `nft` 之间切换转发模式
 - 切换后台日志文件开关
-- 将修改保存回 `config.yaml`
+- 每次修改后立即保存回 `config.yaml`
 
 输入提示会换行显示，便于阅读：
 
 ```text
-Action [a/e/t/d/m/l/s/q]:
+Action [a/e/t/d/m/l/q]:
 └─ 
 ```
 

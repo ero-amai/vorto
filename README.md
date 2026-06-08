@@ -84,10 +84,9 @@ Actions:
   d = delete tunnel
   m = toggle forwarding mode (socket/nft)
   l = toggle daemon log file
-  s = save and exit
   q = quit
 
-Action [a/e/t/d/m/l/s/q]:
+Action [a/e/t/d/m/l/q]:
 └─ 
 ```
 
@@ -141,7 +140,7 @@ tunnels:
 - Linux with the `nft` command available
 - Sufficient privileges to modify nftables
 - Each enabled tunnel must use an IPv4 `listen` address; `0.0.0.0:PORT` matches local IPv4 addresses
-- `target` must also be IPv4
+- `target` must be an IPv4 address or a host name that resolves to IPv4 when rules are applied
 - Loopback targets such as `127.0.0.1:8080` require an explicit loopback `listen` address
 
 ## Runtime Behavior
@@ -182,12 +181,12 @@ The editor lets you:
 - Delete tunnels
 - Toggle forwarding mode between `socket` and `nft`
 - Toggle daemon log file output
-- Save changes back to `config.yaml`
+- Save each change back to `config.yaml` immediately
 
 Input is displayed on a new line for better readability:
 
 ```text
-Action [a/e/t/d/m/l/s/q]:
+Action [a/e/t/d/m/l/q]:
 └─ 
 ```
 
