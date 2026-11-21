@@ -31,7 +31,7 @@ pub struct TunnelManager {
     active: HashMap<String, ActiveTunnel>,
 }
 
-struct ActiveTunnel {
+pub(crate) struct ActiveTunnel {
     spec: TunnelConfig,
     stop_tx: watch::Sender<bool>,
     handles: Vec<JoinHandle<()>>,
@@ -115,7 +115,11 @@ impl TunnelManager {
     }
 
     pub async fn stop_all(&mut self) {
-        let active_tunnels = self.active.drain().map(|(_, active)| active).collect::<Vec<_>>();
+        let active_tunnels = self
+            .active
+            .drain()
+            .map(|(_, active)| active)
+            .collect::<Vec<_>>();
         let mut shutdown_tasks = JoinSet::new();
 
         for active in active_tunnels {
@@ -134,61 +138,70 @@ impl TunnelManager {
 
 impl ActiveTunnel {
     async fn spawn(spec: TunnelConfig) -> AppResult<Self> {
+        let (tunnel, _) = Self::spawn_bound(spec).await?;
+        Ok(tunnel)
+    }
+
+    pub(crate) async fn spawn_bound(spec: TunnelConfig) -> AppResult<(Self, u16)> {
+        let tcp_listener = if spec.protocol.supports_tcp() {
+            Some(build_tcp_listener(&spec.listen).await?)
+        } else {
+            None
+        };
+        let udp_endpoint = if spec.protocol.supports_udp() {
+            let target = resolve_socket_addr(&spec.target, "target").await?;
+            let listener = Arc::new(UdpSocket::bind(&spec.listen).await?);
+            configure_udp_socket(&listener)?;
+            Some((listener, target))
+        } else {
+            None
+        };
+        let listen_port = if let Some(listener) = &tcp_listener {
+            listener.local_addr()?.port()
+        } else if let Some((listener, _)) = &udp_endpoint {
+            listener.local_addr()?.port()
+        } else {
+            unreachable!("every tunnel supports TCP or UDP");
+        };
+
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut handles = Vec::new();
 
-        let spawn_result: AppResult<()> = async {
-            if spec.protocol.supports_tcp() {
-                let tcp_listener = build_tcp_listener(&spec.listen).await?;
-                let tcp_target = spec.target.clone();
-                let tcp_name = spec.name.clone();
-                let tcp_stop = stop_rx.clone();
-                handles.push(tokio::spawn(async move {
-                    if let Err(error) = run_tcp_tunnel(tcp_listener, &tcp_target, tcp_stop).await {
-                        eprintln!("TCP tunnel '{}' stopped: {}", tcp_name, error);
-                    }
-                }));
-            }
-
-            if spec.protocol.supports_udp() {
-                let udp_target = resolve_socket_addr(&spec.target, "target").await?;
-                let udp_listener = Arc::new(UdpSocket::bind(&spec.listen).await?);
-                configure_udp_socket(udp_listener.as_ref())?;
-                let udp_name = spec.name.clone();
-                let udp_stop = stop_rx.clone();
-                handles.push(tokio::spawn(async move {
-                    if let Err(error) =
-                        run_udp_tunnel(udp_name.clone(), udp_listener, udp_target, udp_stop).await
-                    {
-                        eprintln!("UDP tunnel '{}' stopped: {}", udp_name, error);
-                    }
-                }));
-            }
-
-            Ok(())
-        }
-        .await;
-
-        if let Err(error) = spawn_result {
-            let _ = stop_tx.send(true);
-            for handle in handles {
-                wait_for_task_shutdown(handle, "tunnel worker").await;
-            }
-            return Err(error);
+        if let Some(listener) = tcp_listener {
+            let target = spec.target.clone();
+            let name = spec.name.clone();
+            let stop = stop_rx.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(error) = run_tcp_tunnel(listener, &target, stop).await {
+                    eprintln!("TCP tunnel '{}' stopped: {}", name, error);
+                }
+            }));
         }
 
-        Ok(Self {
-            spec,
-            stop_tx,
-            handles,
-        })
+        if let Some((listener, target)) = udp_endpoint {
+            let name = spec.name.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(error) = run_udp_tunnel(name.clone(), listener, target, stop_rx).await {
+                    eprintln!("UDP tunnel '{}' stopped: {}", name, error);
+                }
+            }));
+        }
+
+        Ok((
+            Self {
+                spec,
+                stop_tx,
+                handles,
+            },
+            listen_port,
+        ))
     }
 
-    fn has_finished(&self) -> bool {
+    pub(crate) fn has_finished(&self) -> bool {
         self.handles.iter().any(JoinHandle::is_finished)
     }
 
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         let _ = self.stop_tx.send(true);
         let mut shutdown_tasks = JoinSet::new();
 
@@ -206,21 +219,36 @@ impl ActiveTunnel {
     }
 }
 
+async fn reconcile_config(
+    config: &AppConfig,
+    socket_manager: &mut TunnelManager,
+    nft_manager: &mut NftManager,
+) -> AppResult<()> {
+    match config.mode {
+        AppMode::Socket => {
+            if !socket_manager.start_from_config(config).await {
+                return Err(io::Error::other("Failed to start one or more socket tunnels.").into());
+            }
+            nft_manager.stop_all().await?;
+        }
+        AppMode::Nft => {
+            nft_manager.reconcile(&config.enabled_tunnels()).await?;
+            socket_manager.stop_all().await;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
     let config = AppConfig::load_for_runtime(config_path)?;
-    let desired_tunnels = config.enabled_tunnels();
     let mut socket_manager = TunnelManager::default();
     let mut nft_manager = NftManager::new();
+    let termination = termination_signal()?;
+    tokio::pin!(termination);
 
-    let started = match config.mode {
-        AppMode::Socket => socket_manager.start_from_config(&config).await,
-        AppMode::Nft => nft_manager.reconcile(desired_tunnels.clone()).await,
-    };
-
-    if !started {
+    if let Err(error) = reconcile_config(&config, &mut socket_manager, &mut nft_manager).await {
         socket_manager.stop_all().await;
-        nft_manager.stop_all().await;
-        return Err(io::Error::other("Failed to start one or more tunnels.").into());
+        return Err(error);
     }
     println!("Foreground mode started. Press Ctrl+C to stop.");
 
@@ -228,96 +256,77 @@ pub async fn run_foreground(config_path: &Path) -> AppResult<()> {
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     health_tick.tick().await;
 
-    loop {
+    let result = loop {
         tokio::select! {
-            result = wait_for_termination_signal() => {
-                result?;
-                break;
-            }
+            result = &mut termination => break result,
             _ = health_tick.tick() => {
-                if matches!(config.mode, AppMode::Socket)
-                    && !socket_manager.reconcile(desired_tunnels.clone()).await
-                {
-                    eprintln!("One or more foreground tunnels failed to restart. Will retry.");
+                if let Err(error) = reconcile_config(&config, &mut socket_manager, &mut nft_manager).await {
+                    eprintln!("Forwarding health check failed. Will retry: {error}");
                 }
             }
         }
-    }
+    };
 
     socket_manager.stop_all().await;
-    nft_manager.stop_all().await;
-    Ok(())
+    let cleanup = nft_manager.stop_all().await;
+    result?;
+    cleanup
 }
 
-pub async fn run_config_watcher(config_path: &Path, poll_interval: Duration) -> AppResult<()> {
+pub async fn run_config_watcher(
+    config_path: &Path,
+    poll_interval: Duration,
+    mut report_status: impl FnMut(Option<&str>) -> AppResult<()>,
+) -> AppResult<()> {
     let mut socket_manager = TunnelManager::default();
     let mut nft_manager = NftManager::new();
-    let mut last_applied_config = None::<AppConfig>;
+    let termination = termination_signal()?;
+    tokio::pin!(termination);
 
-    loop {
-        match AppConfig::load_for_runtime(config_path) {
-            Ok(config) => {
-                let config_changed = last_applied_config.as_ref() != Some(&config);
-                let desired_tunnels = config.enabled_tunnels();
-                let applied = match config.mode {
-                    AppMode::Socket => {
-                        let applied = socket_manager.reconcile(desired_tunnels).await;
-                        if applied
-                            && last_applied_config
-                                .as_ref()
-                                .is_some_and(|current| current.mode == AppMode::Nft)
-                        {
-                            nft_manager.stop_all().await;
-                        }
-                        applied
-                    }
-                    AppMode::Nft => {
-                        let applied = nft_manager.reconcile(desired_tunnels).await;
-                        if applied
-                            && last_applied_config
-                                .as_ref()
-                                .is_some_and(|current| current.mode == AppMode::Socket)
-                        {
-                            socket_manager.stop_all().await;
-                        }
-                        applied
-                    }
-                };
-                if applied {
-                    last_applied_config = Some(config);
-                } else if config_changed {
-                    eprintln!(
-                        "Will retry the current config on the next poll because some rules or tunnels failed to start."
-                    );
-                } else {
-                    match config.mode {
-                        AppMode::Socket => eprintln!(
-                            "One or more running tunnels became unhealthy and failed to restart. Will retry on the next poll."
-                        ),
-                        AppMode::Nft => {}
-                    }
-                }
-            }
+    let mut previous_status = None;
+    let result = loop {
+        let applied = match AppConfig::load_for_runtime(config_path) {
+            Ok(config) => reconcile_config(&config, &mut socket_manager, &mut nft_manager).await,
+            Err(error) => Err(error),
+        };
+        let error = match applied {
+            Ok(()) => None,
             Err(error) => {
-                eprintln!(
-                    "Failed to read config. Keeping current tunnels unchanged: {}",
-                    error
-                );
+                let mut message = error.to_string();
+                // A broken new config must not prevent repair of the last installed rules.
+                if let Err(recovery_error) = nft_manager.recover_active().await
+                    && recovery_error.to_string() != message
+                {
+                    use std::fmt::Write as _;
+                    write!(
+                        message,
+                        "\nFailed to recover installed nft rules: {recovery_error}"
+                    )
+                    .unwrap();
+                }
+                Some(message)
             }
+        };
+        if previous_status.as_ref() != Some(&error) {
+            if let Some(error) = &error {
+                eprintln!("Forwarding failed. Will retry: {error}");
+            }
+            if let Err(error) = report_status(error.as_deref()) {
+                break Err(io::Error::other(error));
+            }
+            previous_status = Some(error);
         }
 
         tokio::select! {
-            result = wait_for_termination_signal() => {
-                result?;
-                break;
-            }
+            result = &mut termination => break result,
             _ = tokio::time::sleep(poll_interval) => {}
         }
-    }
+    };
 
     socket_manager.stop_all().await;
-    nft_manager.stop_all().await;
-    Ok(())
+    let cleanup = nft_manager.stop_all().await;
+    result?;
+    cleanup
 }
 
 async fn build_tcp_listener(listen: &str) -> AppResult<TcpListener> {
@@ -676,24 +685,26 @@ async fn wait_for_shutdown(stop_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn wait_for_termination_signal() -> io::Result<()> {
+fn termination_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
     #[cfg(unix)]
-    {
+    let (mut terminate, mut interrupt) = {
         use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
 
-        let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        #[cfg(unix)]
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
+            _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
+        #[cfg(not(unix))]
         tokio::signal::ctrl_c().await?;
         Ok(())
-    }
+    })
 }
 
 #[cfg(test)]

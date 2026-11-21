@@ -139,9 +139,12 @@ tunnels:
 
 - Linux with the `nft` command available
 - Sufficient privileges to modify nftables
-- Each enabled tunnel must use an IPv4 `listen` address; `0.0.0.0:PORT` matches local IPv4 addresses
+- Each enabled tunnel must use an IPv4 `listen` address. `0.0.0.0:PORT` includes addresses assigned to local interfaces, such as the private address used by an upstream NAT port forward.
 - `target` must be an IPv4 address or a host name that resolves to IPv4 when rules are applied
 - Loopback targets such as `127.0.0.1:8080` require an explicit loopback `listen` address
+- Forwarding incoming packets to another host requires IPv4 forwarding in vorto's network namespace (`net.ipv4.ip_forward=1` or forwarding enabled on the ingress interface) and a firewall that permits the forwarded traffic.
+
+An upstream NAT gateway must forward the public port to the vorto host's IPv4 address and listening port. Connections from a local loopback address to a remote target use a loopback proxy so they work with the default `route_localnet` setting.
 
 ## Runtime Behavior
 
@@ -158,12 +161,12 @@ tunnels:
 - Removes deleted tunnels
 - Starts newly added tunnels
 - Restarts only tunnels whose config changed in `socket` mode
-- Rebuilds the nftables ruleset when config changes in `nft` mode
+- Replaces the nftables ruleset atomically and restores it if its table or rules are removed
 - Keeps unchanged tunnels running without unnecessary interruption
 - Writes daemon stdout/stderr to `./vorto.log` when `daemon_log: true`
 - Discards daemon stdout/stderr when `daemon_log: false`
 
-If a config reload fails, the daemon keeps the currently running tunnels unchanged and retries on the next poll.
+If an nftables reload fails, the existing rules stay in place and the daemon retries on the next poll. The `daemon` command waits for the first apply result. `status` shows the latest forwarding apply error even when daemon logging is disabled.
 
 ## Interactive Editor
 

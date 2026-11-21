@@ -1,119 +1,199 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::config::TunnelConfig;
+use crate::{AppResult, config::TunnelConfig};
 
 #[cfg(target_os = "linux")]
-use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::fmt::Write as _;
-#[cfg(target_os = "linux")]
-use std::io::{self, Write};
-#[cfg(target_os = "linux")]
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
-#[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Write as _,
+    fs, io,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
+    path::Path,
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "linux")]
-use crate::AppResult;
+use crate::{config::Protocol, runtime::ActiveTunnel};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncWriteExt;
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct NftManager {
+    #[cfg(target_os = "linux")]
     names: NftNames,
-    active_specs: Vec<TunnelConfig>,
-    table_active: bool,
+    #[cfg(target_os = "linux")]
+    active: Option<AppliedRuleset>,
+    #[cfg(target_os = "linux")]
+    proxies: HashMap<ProxyKey, LoopbackProxy>,
+}
+
+#[cfg(target_os = "linux")]
+struct AppliedRuleset {
+    specs: Vec<TunnelConfig>,
+    ruleset: NftRuleset,
+    snapshot: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+type ProxyKey = (SocketAddrV4, Protocol);
+
+#[cfg(target_os = "linux")]
+struct LoopbackProxy {
+    tunnel: ActiveTunnel,
+    port: u16,
 }
 
 impl NftManager {
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
             names: NftNames::new(),
-            active_specs: Vec::new(),
-            table_active: false,
+            #[cfg(target_os = "linux")]
+            active: None,
+            #[cfg(target_os = "linux")]
+            proxies: HashMap::new(),
         }
     }
 
-    pub async fn reconcile(&mut self, desired_tunnels: Vec<TunnelConfig>) -> bool {
+    pub async fn reconcile(&mut self, desired: &[TunnelConfig]) -> AppResult<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = desired_tunnels;
-            eprintln!("nft mode is only supported on Linux.");
-            false
+            let _ = desired;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "nft mode is only supported on Linux.",
+            )
+            .into())
         }
 
         #[cfg(target_os = "linux")]
         {
-            if self.table_active && self.active_specs == desired_tunnels {
-                return true;
+            if desired.is_empty() {
+                return self.stop_all().await;
             }
 
-            match NftRuleset::from_tunnels(&desired_tunnels, &self.names)
-                .and_then(|ruleset| self.apply_ruleset(&ruleset))
+            let mut ruleset = match &self.active {
+                Some(active) if active.specs == desired => active.ruleset.clone(),
+                _ => NftRuleset::from_tunnels(desired)?,
+            };
+            ruleset.update_local_addresses()?;
+
+            if let Some(active) = &self.active
+                && ruleset == active.ruleset
+                && self
+                    .proxies
+                    .values()
+                    .all(|proxy| !proxy.tunnel.has_finished())
+                && active.snapshot.is_some()
+                && list_table(&self.names.table)? == active.snapshot
             {
-                Ok(()) => {
-                    self.active_specs = desired_tunnels;
-                    self.table_active = !self.active_specs.is_empty();
-                    true
+                return Ok(());
+            }
+
+            // Bind replacements before publishing their ports. On a failed batch the
+            // old rules and their listeners remain usable.
+            let mut replacements = HashMap::new();
+            let mut ports = HashMap::new();
+            for key in ruleset.rules.iter().filter_map(NftRule::proxy_key) {
+                if ports.contains_key(&key) {
+                    continue;
                 }
-                Err(error) => {
-                    eprintln!("Failed to apply nft rules: {}", error);
-                    false
-                }
+                let proxy = match self.proxies.get(&key) {
+                    Some(proxy) if !proxy.tunnel.has_finished() => proxy,
+                    _ => {
+                        let (target, protocol) = key;
+                        let (tunnel, port) = ActiveTunnel::spawn_bound(TunnelConfig {
+                            name: format!("nft loopback to {target}"),
+                            listen: "127.0.0.1:0".to_owned(),
+                            target: target.to_string(),
+                            protocol,
+                            enabled: true,
+                        })
+                        .await?;
+                        replacements
+                            .entry(key)
+                            .or_insert(LoopbackProxy { tunnel, port })
+                    }
+                };
+                ports.insert(key, proxy.port);
+            }
+
+            let script = ruleset.render_script(&self.names, &ports);
+            let expected_rules = script
+                .lines()
+                .filter(|line| line.starts_with("add rule "))
+                .count();
+            run_nft_script(&script).await?;
+            self.proxies.retain(|key, _| ports.contains_key(key));
+            self.proxies.extend(replacements);
+            let active = self.active.insert(AppliedRuleset {
+                specs: desired.to_vec(),
+                ruleset,
+                snapshot: None,
+            });
+            let snapshot = list_table(&self.names.table)?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "nft table '{}' disappeared after apply",
+                    self.names.table
+                ))
+            })?;
+            // In a table listing, only rules have handles at the second indentation level.
+            let installed_rules = snapshot
+                .lines()
+                .filter(|line| line.starts_with("\t\t") && line.contains(" # handle "))
+                .count();
+            if installed_rules != expected_rules {
+                return Err(io::Error::other(format!(
+                    "nft table '{}' has {installed_rules} of {expected_rules} expected rules after apply",
+                    self.names.table
+                ))
+                .into());
+            }
+            active.snapshot = Some(snapshot);
+            Ok(())
+        }
+    }
+
+    pub async fn recover_active(&mut self) -> AppResult<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(active) = &self.active {
+            let specs = active.specs.clone();
+            return self.reconcile(&specs).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn stop_all(&mut self) -> AppResult<()> {
+        #[cfg(target_os = "linux")]
+        if self.active.is_some() {
+            delete_table(&self.names.table)?;
+            self.active = None;
+            for (_, proxy) in self.proxies.drain() {
+                proxy.tunnel.stop().await;
             }
         }
-    }
 
-    pub async fn stop_all(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.table_active
-            && let Err(error) = delete_table(&self.names.table)
-        {
-            eprintln!(
-                "Failed to delete nft table '{}': {}",
-                self.names.table, error
-            );
-        }
-
-        self.active_specs.clear();
-        self.table_active = false;
-    }
-
-    #[cfg(target_os = "linux")]
-    fn apply_ruleset(&self, ruleset: &NftRuleset) -> AppResult<()> {
-        if ruleset.is_empty() {
-            delete_table(&self.names.table)?;
-            return Ok(());
-        }
-
-        let _ = delete_table(&self.names.table);
-        run_nft_script(&ruleset.render_script())
+        Ok(())
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for NftManager {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.table_active
+        if self.active.is_some()
             && let Err(error) = delete_table(&self.names.table)
         {
-            eprintln!(
-                "Failed to delete nft table '{}' during drop: {}",
-                self.names.table, error
-            );
+            eprintln!("Failed to delete nft table '{}': {error}", self.names.table);
         }
     }
 }
 
-#[derive(Clone)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 struct NftNames {
     table: String,
-    prerouting_chain: String,
-    output_chain: String,
-    postrouting_chain: String,
-    target_set: String,
     mark: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl NftNames {
     fn new() -> Self {
         let pid = std::process::id();
@@ -121,164 +201,248 @@ impl NftNames {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let suffix = format!("{pid}_{unique}");
-
         Self {
-            table: format!("vorto_nat_{suffix}"),
-            prerouting_chain: format!("vorto_pre_{suffix}"),
-            output_chain: format!("vorto_out_{suffix}"),
-            postrouting_chain: format!("vorto_post_{suffix}"),
-            target_set: format!("vorto_targets_{suffix}"),
+            table: format!("vorto_nat_{pid}_{unique}"),
             mark: 0x7600_0000 | (((pid as u128) ^ unique) as u32 & 0x00ff_ffff),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
 struct NftRuleset {
-    names: NftNames,
     rules: Vec<NftRule>,
-    masquerade_targets: Vec<Ipv4Addr>,
+    local_addresses: Option<BTreeSet<Ipv4Addr>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NftRule {
+    listen: SocketAddrV4,
+    target: SocketAddrV4,
+    protocol: Protocol,
+}
+
+#[cfg(target_os = "linux")]
+impl NftRule {
+    fn proxy_key(&self) -> Option<ProxyKey> {
+        (!self.target.ip().is_loopback()).then_some((self.target, self.protocol))
+    }
+
+    fn listen_match(&self) -> String {
+        let protocol = self.protocol.label();
+        let port = self.listen.port();
+        if self.listen.ip().is_unspecified() {
+            format!("{protocol} dport {port}")
+        } else {
+            format!("ip daddr {} {protocol} dport {port}", self.listen.ip())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl NftRuleset {
-    fn from_tunnels(tunnels: &[TunnelConfig], names: &NftNames) -> AppResult<Self> {
+    fn from_tunnels(tunnels: &[TunnelConfig]) -> AppResult<Self> {
         let mut rules = Vec::new();
-        let mut targets = HashSet::new();
-
         for tunnel in tunnels {
-            let listen = tunnel.listen.parse::<SocketAddr>()?;
-            let target_v4 = resolve_ipv4_target(&tunnel.target)?;
-
-            let SocketAddr::V4(listen_v4) = listen else {
+            let listen = tunnel.listen.parse::<SocketAddrV4>()?;
+            let target = resolve_ipv4_target(&tunnel.target)?;
+            if target.ip().is_loopback() && !listen.ip().is_loopback() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "nft mode only supports IPv4 listen addresses: {}",
-                        tunnel.listen
-                    ),
-                )
-                .into());
-            };
-
-            if target_v4.ip().is_loopback()
-                && (listen_v4.ip().is_unspecified() || !listen_v4.ip().is_loopback())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "nft mode can only target loopback addresses from explicit loopback listen addresses: {} -> {}",
-                        tunnel.listen, tunnel.target
+                        "nft mode can only target loopback addresses from explicit loopback listen addresses: {listen} -> {target}"
                     ),
                 )
                 .into());
             }
-
-            if tunnel.protocol.supports_tcp() {
-                rules.push(NftRule::Tcp {
-                    listen_ip: (!listen_v4.ip().is_unspecified()).then_some(*listen_v4.ip()),
-                    listen_port: listen_v4.port(),
-                    target_ip: *target_v4.ip(),
-                    target_port: target_v4.port(),
-                });
-            }
-
-            if tunnel.protocol.supports_udp() {
-                rules.push(NftRule::Udp {
-                    listen_ip: (!listen_v4.ip().is_unspecified()).then_some(*listen_v4.ip()),
-                    listen_port: listen_v4.port(),
-                    target_ip: *target_v4.ip(),
-                    target_port: target_v4.port(),
-                });
-            }
-
-            if !target_v4.ip().is_loopback() {
-                targets.insert(*target_v4.ip());
+            for protocol in [Protocol::Tcp, Protocol::Udp] {
+                if tunnel.protocol == protocol || tunnel.protocol == Protocol::Both {
+                    rules.push(NftRule {
+                        listen,
+                        target,
+                        protocol,
+                    });
+                }
             }
         }
 
-        let mut masquerade_targets = targets.into_iter().collect::<Vec<_>>();
-        masquerade_targets.sort_unstable();
-
         Ok(Self {
-            names: names.clone(),
             rules,
-            masquerade_targets,
+            local_addresses: None,
         })
     }
 
-    fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+    fn update_local_addresses(&mut self) -> AppResult<()> {
+        let addresses = interface_ipv4_addresses()?;
+        let needs_forwarding = self
+            .rules
+            .iter()
+            .find(|rule| !rule.listen.ip().is_loopback() && !addresses.contains(rule.target.ip()));
+        if let Some(rule) = needs_forwarding
+            && !ipv4_forwarding_enabled()?
+        {
+            return Err(io::Error::other(format!(
+                "nft forwarding {} -> {} requires net.ipv4.ip_forward=1 or IPv4 forwarding on the ingress interface",
+                rule.listen, rule.target
+            ))
+            .into());
+        }
+        self.local_addresses = self
+            .rules
+            .iter()
+            .any(|rule| rule.listen.ip().is_unspecified())
+            .then(|| {
+                addresses
+                    .into_iter()
+                    .filter(|address| !address.is_loopback())
+                    .collect()
+            });
+        Ok(())
     }
 
-    fn render_script(&self) -> String {
-        let mut script = String::new();
-        writeln!(&mut script, "add table ip {}", self.names.table).unwrap();
-        writeln!(
-            &mut script,
-            "add chain ip {} {} {{ type nat hook prerouting priority -100; }}",
-            self.names.table, self.names.prerouting_chain
-        )
-        .unwrap();
-        writeln!(
-            &mut script,
-            "add chain ip {} {} {{ type nat hook output priority -100; }}",
-            self.names.table, self.names.output_chain
-        )
-        .unwrap();
-        writeln!(
-            &mut script,
-            "add chain ip {} {} {{ type nat hook postrouting priority 100; }}",
-            self.names.table, self.names.postrouting_chain
-        )
-        .unwrap();
-
-        if !self.masquerade_targets.is_empty() {
+    fn render_script(&self, names: &NftNames, proxy_ports: &HashMap<ProxyKey, u16>) -> String {
+        let table = &names.table;
+        let mark = names.mark;
+        // The first add makes the batch work even if the table was externally removed.
+        let mut script =
+            format!("add table ip {table}\ndelete table ip {table}\nadd table ip {table}\n");
+        for (chain, priority) in [("prerouting", -100), ("output", -100), ("postrouting", 100)] {
             writeln!(
-                &mut script,
-                "add set ip {} {} {{ type ipv4_addr; flags interval; }}",
-                self.names.table, self.names.target_set
+                script,
+                "add chain ip {table} {chain} {{ type nat hook {chain} priority {priority}; }}"
             )
             .unwrap();
+        }
 
-            for target in &self.masquerade_targets {
+        if let Some(addresses) = &self.local_addresses {
+            writeln!(
+                script,
+                "add set ip {table} local_ipv4 {{ type ipv4_addr; flags interval; }}"
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "add element ip {table} local_ipv4 {{ 127.0.0.0/8 }}"
+            )
+            .unwrap();
+            for address in addresses {
+                writeln!(script, "add element ip {table} local_ipv4 {{ {address} }}").unwrap();
+            }
+            for (hook, chain, guard) in [
+                (
+                    "prerouting",
+                    "wildcard_prerouting",
+                    "ip daddr != 127.0.0.0/8 ",
+                ),
+                ("output", "wildcard_output", ""),
+            ] {
+                writeln!(script, "add chain ip {table} {chain}").unwrap();
                 writeln!(
-                    &mut script,
-                    "add element ip {} {} {{ {} }}",
-                    self.names.table, self.names.target_set, target
+                    script,
+                    "add rule ip {table} {hook} {guard}ip daddr @local_ipv4 jump {chain}"
+                )
+                .unwrap();
+                writeln!(
+                    script,
+                    "add rule ip {table} {hook} {guard}fib daddr type local jump {chain}"
                 )
                 .unwrap();
             }
+        }
 
+        let targets = self
+            .rules
+            .iter()
+            .filter_map(|rule| (!rule.target.ip().is_loopback()).then_some(*rule.target.ip()))
+            .collect::<BTreeSet<_>>();
+        if !targets.is_empty() {
+            writeln!(script, "add set ip {table} targets {{ type ipv4_addr; }}").unwrap();
+            for target in targets {
+                writeln!(script, "add element ip {table} targets {{ {target} }}").unwrap();
+            }
             writeln!(
-                &mut script,
-                "add rule ip {} {} meta mark 0x{:x} ip daddr @{} masquerade",
-                self.names.table,
-                self.names.postrouting_chain,
-                self.names.mark,
-                self.names.target_set
+                script,
+                "add rule ip {table} postrouting meta mark 0x{mark:x} ip daddr @targets masquerade"
             )
             .unwrap();
         }
 
         for rule in &self.rules {
-            for rendered in rule.render(
-                &self.names.table,
-                &self.names.prerouting_chain,
-                self.names.mark,
-            ) {
-                writeln!(&mut script, "{rendered}").unwrap();
+            let matches = rule.listen_match();
+            let target = rule.target;
+            let (prerouting, output) = if rule.listen.ip().is_unspecified() {
+                ("wildcard_prerouting", "wildcard_output")
+            } else {
+                ("prerouting", "output")
+            };
+            if !rule.listen.ip().is_loopback() {
+                writeln!(script, "add rule ip {table} {prerouting} {matches} meta mark set 0x{mark:x} dnat to {target}").unwrap();
             }
-            for rendered in
-                rule.render(&self.names.table, &self.names.output_chain, self.names.mark)
-            {
-                writeln!(&mut script, "{rendered}").unwrap();
+            if let Some(key) = rule.proxy_key() {
+                let port = proxy_ports[&key];
+                // DNAT alone cannot route a locally sourced 127/8 packet off host.
+                writeln!(script, "add rule ip {table} {output} ip saddr 127.0.0.0/8 {matches} redirect to :{port}").unwrap();
             }
+            writeln!(
+                script,
+                "add rule ip {table} {output} {matches} meta mark set 0x{mark:x} dnat to {target}"
+            )
+            .unwrap();
         }
 
         script
     }
+}
+
+#[cfg(target_os = "linux")]
+fn interface_ipv4_addresses() -> io::Result<BTreeSet<Ipv4Addr>> {
+    let mut interfaces = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut addresses = BTreeSet::new();
+    // getifaddrs owns the list and its sockaddr entries until freeifaddrs.
+    unsafe {
+        let mut current = interfaces;
+        while let Some(interface) = current.as_ref() {
+            if !interface.ifa_addr.is_null()
+                && (*interface.ifa_addr).sa_family as libc::c_int == libc::AF_INET
+            {
+                let addr = &*interface.ifa_addr.cast::<libc::sockaddr_in>();
+                addresses.insert(Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()));
+            }
+            current = interface.ifa_next;
+        }
+        libc::freeifaddrs(interfaces);
+    }
+    Ok(addresses)
+}
+
+#[cfg(target_os = "linux")]
+fn ipv4_forwarding_enabled() -> io::Result<bool> {
+    let sysctl = Path::new("/proc/sys/net/ipv4");
+    if fs::read_to_string(sysctl.join("ip_forward"))?.trim() == "1" {
+        return Ok(true);
+    }
+
+    for entry in fs::read_dir(sysctl.join("conf"))? {
+        let entry = entry?;
+        if ["all", "default", "lo"]
+            .iter()
+            .any(|name| entry.file_name() == *name)
+        {
+            continue;
+        }
+        match fs::read_to_string(entry.path().join("forwarding")) {
+            Ok(value) if value.trim() == "1" => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -316,186 +480,131 @@ fn resolve_ipv4_target(value: &str) -> AppResult<SocketAddrV4> {
 }
 
 #[cfg(target_os = "linux")]
-enum NftRule {
-    Tcp {
-        listen_ip: Option<Ipv4Addr>,
-        listen_port: u16,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-    },
-    Udp {
-        listen_ip: Option<Ipv4Addr>,
-        listen_port: u16,
-        target_ip: Ipv4Addr,
-        target_port: u16,
-    },
-}
-
-#[cfg(target_os = "linux")]
-impl NftRule {
-    fn render(&self, table: &str, chain: &str, mark: u32) -> Vec<String> {
-        match self {
-            Self::Tcp {
-                listen_ip,
-                listen_port,
-                target_ip,
-                target_port,
-            } => vec![format!(
-                "add rule ip {table} {chain} {} meta mark set 0x{mark:x} dnat to {target_ip}:{target_port}",
-                listen_match("tcp", *listen_ip, *listen_port)
-            )],
-            Self::Udp {
-                listen_ip,
-                listen_port,
-                target_ip,
-                target_port,
-            } => vec![format!(
-                "add rule ip {table} {chain} {} meta mark set 0x{mark:x} dnat to {target_ip}:{target_port}",
-                listen_match("udp", *listen_ip, *listen_port)
-            )],
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn listen_match(protocol: &str, listen_ip: Option<Ipv4Addr>, listen_port: u16) -> String {
-    match listen_ip {
-        Some(listen_ip) => format!("ip daddr {listen_ip} {protocol} dport {listen_port}"),
-        None => format!("fib daddr type local {protocol} dport {listen_port}"),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn run_nft_script(script: &str) -> AppResult<()> {
-    let mut child = Command::new("nft")
+async fn run_nft_script(script: &str) -> AppResult<()> {
+    let mut child = tokio::process::Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("Could not run nft: {error}")))?;
+    let mut stdin = child.stdin.take().expect("nft stdin is piped");
+    let (write_result, output) = tokio::join!(
+        async move { stdin.write_all(script.as_bytes()).await },
+        child.wait_with_output()
+    );
+    let output = output?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
             "nft apply failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
-        .into())
+        .into());
     }
+    write_result?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn list_table(table: &str) -> AppResult<Option<String>> {
+    table_command("list", table)
 }
 
 #[cfg(target_os = "linux")]
 fn delete_table(table: &str) -> AppResult<()> {
+    table_command("delete", table)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn table_command(action: &str, table: &str) -> AppResult<Option<String>> {
     let output = Command::new("nft")
-        .args(["delete", "table", "ip", table])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
+        .env("LC_ALL", "C")
+        .args(["-a", "-s", "-n", action, "table", "ip", table])
+        .output()
+        .map_err(|error| io::Error::new(error.kind(), format!("Could not run nft: {error}")))?;
 
     if output.status.success() {
-        return Ok(());
+        return Ok(Some(String::from_utf8(output.stdout)?));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("No such file or directory") {
-        return Ok(());
+        return Ok(None);
     }
 
-    Err(io::Error::other(format!("nft delete table failed: {}", stderr.trim())).into())
+    Err(io::Error::other(format!(
+        "nft {action} table {table} failed: {}",
+        stderr.trim()
+    ))
+    .into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use std::net::Ipv4Addr;
-
     use super::*;
 
     #[test]
-    fn nft_names_are_unique() {
-        let first = NftNames::new();
-        let second = NftNames::new();
-        assert_ne!(first.table, second.table);
-        assert_ne!(first.prerouting_chain, second.prerouting_chain);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn render_ruleset_contains_unique_table_and_rules() {
+    fn wildcard_rules_match_interface_addresses_and_limit_dnat_to_local_destinations() {
         let names = NftNames::new();
-        let ruleset = NftRuleset {
-            names: names.clone(),
-            rules: vec![
-                NftRule::Tcp {
-                    listen_ip: Some(Ipv4Addr::new(127, 0, 0, 1)),
-                    listen_port: 8080,
-                    target_ip: Ipv4Addr::new(10, 0, 0, 2),
-                    target_port: 80,
-                },
-                NftRule::Udp {
-                    listen_ip: None,
-                    listen_port: 5353,
-                    target_ip: Ipv4Addr::new(1, 1, 1, 1),
-                    target_port: 53,
-                },
-            ],
-            masquerade_targets: vec![Ipv4Addr::new(10, 0, 0, 2)],
-        };
-
-        let script = ruleset.render_script();
-        assert!(script.contains(&format!("add table ip {}", names.table)));
-        assert!(script.contains(&format!(
-            "tcp dport 8080 meta mark set 0x{:x} dnat to 10.0.0.2:80",
-            names.mark
-        )));
-        assert!(script.contains(&format!(
-            "udp dport 5353 meta mark set 0x{:x} dnat to 1.1.1.1:53",
-            names.mark
-        )));
-        assert!(script.contains("fib daddr type local udp dport 5353"));
-        assert!(script.contains(&names.target_set));
-        assert!(script.contains(&format!(
-            "meta mark 0x{:x} ip daddr @{} masquerade",
-            names.mark, names.target_set
-        )));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn render_ruleset_does_not_masquerade_unmarked_traffic_to_target_ip() {
-        let names = NftNames::new();
-        let tunnel = TunnelConfig {
-            name: "remote".to_string(),
-            listen: "127.0.0.1:8080".to_string(),
-            target: "10.0.0.2:80".to_string(),
-            protocol: crate::config::Protocol::Tcp,
+        let target: SocketAddrV4 = "192.0.2.50:9000".parse().unwrap();
+        let mut ruleset = NftRuleset::from_tunnels(&[TunnelConfig {
+            name: "wildcard".to_owned(),
+            listen: "0.0.0.0:8000".to_owned(),
+            target: target.to_string(),
+            protocol: Protocol::Both,
             enabled: true,
-        };
+        }])
+        .unwrap();
+        ruleset.local_addresses = Some([Ipv4Addr::new(10, 0, 0, 2)].into());
+        let ports = HashMap::from([
+            ((target, Protocol::Tcp), 20000),
+            ((target, Protocol::Udp), 20001),
+        ]);
+        let script = ruleset.render_script(&names, &ports);
+        let table = &names.table;
 
-        let script = NftRuleset::from_tunnels(&[tunnel], &names)
-            .expect("ruleset should render")
-            .render_script();
-
-        assert!(!script.contains(&format!(
-            "add rule ip {} {} ip daddr @{} masquerade",
-            names.table, names.postrouting_chain, names.target_set
+        assert!(script.starts_with(&format!(
+            "add table ip {table}\ndelete table ip {table}\nadd table ip {table}\n"
         )));
+        assert!(script.contains("local_ipv4 { 10.0.0.2 }"));
+        assert!(script.contains(
+            "prerouting ip daddr != 127.0.0.0/8 ip daddr @local_ipv4 jump wildcard_prerouting"
+        ));
+        assert!(script.contains("fib daddr type local jump wildcard_prerouting"));
+        let redirect = script
+            .find("wildcard_output ip saddr 127.0.0.0/8 tcp dport 8000 redirect to :20000")
+            .unwrap();
+        let dnat = script
+            .find("wildcard_output tcp dport 8000 meta mark")
+            .unwrap();
+        assert!(redirect < dnat);
+        assert!(
+            script
+                .contains("wildcard_output ip saddr 127.0.0.0/8 udp dport 8000 redirect to :20001")
+        );
         assert!(script.contains(&format!(
-            "add rule ip {} {} meta mark 0x{:x} ip daddr @{} masquerade",
-            names.table, names.postrouting_chain, names.mark, names.target_set
+            "postrouting meta mark 0x{:x} ip daddr @targets masquerade",
+            names.mark
         )));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn drop_skips_delete_when_table_is_not_active() {
-        let manager = NftManager::new();
-        drop(manager);
+    fn loopback_to_loopback_keeps_kernel_dnat() {
+        let names = NftNames::new();
+        let ruleset = NftRuleset::from_tunnels(&[TunnelConfig {
+            name: "local".to_owned(),
+            listen: "127.0.0.1:8000".to_owned(),
+            target: "127.0.0.1:9000".to_owned(),
+            protocol: Protocol::Tcp,
+            enabled: true,
+        }])
+        .unwrap();
+
+        let script = ruleset.render_script(&names, &HashMap::new());
+        assert!(script.contains("output ip daddr 127.0.0.1 tcp dport 8000"));
+        assert!(script.contains("dnat to 127.0.0.1:9000"));
+        assert!(!script.contains("redirect to"));
+        assert!(!script.contains("prerouting ip daddr 127.0.0.1"));
     }
 }

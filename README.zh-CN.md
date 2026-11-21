@@ -133,9 +133,12 @@ tunnels:
 
 - Linux 且系统中可用 `nft` 命令
 - 拥有修改 nftables 的权限
-- 每个启用的 tunnel 都必须使用 IPv4 `listen` 地址；`0.0.0.0:PORT` 会匹配本机 IPv4 地址
+- 每个启用的 tunnel 都必须使用 IPv4 `listen` 地址。`0.0.0.0:PORT` 会匹配分配给本机网卡的 IPv4 地址，包括上游 NAT 端口转发所用的内网地址。
 - `target` 必须是 IPv4 地址，或是在应用规则时能解析出 IPv4 的域名
 - `127.0.0.1:8080` 这类 loopback target 必须搭配明确的 loopback `listen` 地址
+- 将入站流量转发到另一台主机时，需要在 vorto 所在网络命名空间启用 IPv4 转发（`net.ipv4.ip_forward=1` 或在入站接口启用转发），防火墙也需要允许该流量。
+
+如果 vorto 位于 NAT 后面，上游网关需要把公网端口映射到 vorto 主机的 IPv4 地址和监听端口。本机从回环地址访问远端 target 时使用回环代理，默认的 `route_localnet` 设置即可工作。
 
 ## 运行时行为
 
@@ -152,12 +155,12 @@ tunnels:
 - 删除已不存在的 tunnel
 - 启动新增加的 tunnel
 - `socket` 模式下仅重启真正发生变化的 tunnel
-- `nft` 模式下配置变化时会重建 nftables 规则集
+- `nft` 模式在同一事务中替换规则集，并在规则或表被清除后自动恢复
 - 未变化的 tunnel 会保持运行，不会被无意义断流
 - `daemon_log: true` 时会把后台进程输出写到 `./vorto.log`
 - `daemon_log: false` 时会丢弃后台进程输出
 
-如果配置重载失败，后台模式会保留当前正在运行的 tunnel，并在下一次轮询时继续重试。
+如果 nftables 热重载失败，后台进程会保留已有规则，并在下一次轮询时重试。`daemon` 会等待首次应用配置的结果，`status` 在关闭日志时仍会显示最近的转发配置错误。
 
 ## 交互式编辑器
 

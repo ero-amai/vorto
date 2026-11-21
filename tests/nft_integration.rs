@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -41,6 +42,15 @@ fn nft_mode_process_lifecycle_cleans_rules_and_forwards_tcp() {
     wait_for_echo(listen, b"nft-lifecycle", STARTUP_TIMEOUT)
         .expect("nft mode should forward traffic while the process is running");
 
+    for action in ["flush", "delete"] {
+        assert!(command_succeeds(
+            "nft",
+            [action, "table", "ip", &table_name]
+        ));
+        wait_for_echo(listen, b"nft-recovered", STARTUP_TIMEOUT)
+            .expect("foreground nft mode should restore missing rules");
+    }
+
     process
         .terminate()
         .expect("vorto process should exit cleanly on SIGTERM");
@@ -48,6 +58,38 @@ fn nft_mode_process_lifecycle_cleans_rules_and_forwards_tcp() {
         .expect("nft table should be removed after process shutdown");
 
     drop(backend);
+}
+
+#[test]
+fn nft_daemon_reports_failed_apply_even_without_logging() {
+    let config_dir = TestDir::new("nft-readiness");
+    write_config(
+        config_dir.path(),
+        "127.0.0.1:18080".parse().unwrap(),
+        "127.0.0.1:18081".parse().unwrap(),
+    )
+    .unwrap();
+    let nft = config_dir.path().join("nft");
+    fs::write(&nft, "#!/bin/sh\necho 'injected nft failure' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(nft, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |action| {
+        Command::new(BIN)
+            .arg(action)
+            .current_dir(config_dir.path())
+            .env("PATH", config_dir.path())
+            .output()
+    };
+    let start = run("daemon");
+    let status = run("status");
+    let stop = run("stop");
+
+    let start = start.unwrap();
+    let status = status.unwrap();
+    assert!(stop.unwrap().status.success());
+    assert!(!start.status.success());
+    assert!(String::from_utf8_lossy(&start.stderr).contains("injected nft failure"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("injected nft failure"));
 }
 
 #[test]

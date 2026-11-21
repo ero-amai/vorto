@@ -6,11 +6,11 @@ mod version;
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -23,7 +23,9 @@ type ProcessId = u32;
 const CONFIG_FILE: &str = "config.yaml";
 const PID_FILE: &str = "vorto.pid";
 const LOG_FILE: &str = "vorto.log";
+const STATUS_FILE: &str = "vorto.status";
 const DEFAULT_POLL_SECS: u64 = 2;
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_WORKER: &str = "__daemon_worker";
 
 #[tokio::main]
@@ -40,13 +42,16 @@ async fn entry() -> AppResult<()> {
     let config_path = cwd.join(CONFIG_FILE);
     let pid_path = cwd.join(PID_FILE);
     let log_path = cwd.join(LOG_FILE);
+    let status_path = cwd.join(STATUS_FILE);
 
     match args.first().map(String::as_str) {
         Some("config") | Some("create") => interactive::manage_config(&config_path),
         Some("run") => runtime::run_foreground(&config_path).await,
-        Some("daemon") => start_daemon(&cwd, &config_path, &pid_path, &log_path),
+        Some("daemon") => {
+            start_daemon(&cwd, &config_path, &pid_path, &log_path, &status_path).await
+        }
         Some("stop") => stop_daemon(&pid_path),
-        Some("status") => print_status(&pid_path),
+        Some("status") => print_status(&pid_path, &status_path),
         Some("version") | Some("-V") | Some("--version") => {
             version::print();
             Ok(())
@@ -56,8 +61,13 @@ async fn entry() -> AppResult<()> {
             Ok(())
         }
         Some(DAEMON_WORKER) => {
-            let _pid_guard = PidFileGuard::new(&pid_path)?;
-            runtime::run_config_watcher(&config_path, Duration::from_secs(DEFAULT_POLL_SECS)).await
+            let pid_guard = PidFileGuard::new(&pid_path)?;
+            runtime::run_config_watcher(
+                &config_path,
+                Duration::from_secs(DEFAULT_POLL_SECS),
+                |error| write_daemon_status(&status_path, pid_guard.pid, error),
+            )
+            .await
         }
         _ => {
             print_help();
@@ -66,13 +76,22 @@ async fn entry() -> AppResult<()> {
     }
 }
 
-fn start_daemon(cwd: &Path, config_path: &Path, pid_path: &Path, log_path: &Path) -> AppResult<()> {
+async fn start_daemon(
+    cwd: &Path,
+    config_path: &Path,
+    pid_path: &Path,
+    log_path: &Path,
+    status_path: &Path,
+) -> AppResult<()> {
     if let Some(pid) = read_pid(pid_path)? {
         if daemon_process_matches(pid)? {
-            println!("Daemon is already running with PID {}.", pid);
+            ensure_forwarding_ready(pid, read_daemon_status(status_path, pid)?.as_deref())?;
+            println!("Daemon is already running with PID {pid}.");
             return Ok(());
         }
-        let _ = fs::remove_file(pid_path);
+        if read_pid(pid_path)? == Some(pid) {
+            let _ = fs::remove_file(pid_path);
+        }
     }
 
     let config = AppConfig::load_for_runtime(config_path)?;
@@ -102,8 +121,24 @@ fn start_daemon(cwd: &Path, config_path: &Path, pid_path: &Path, log_path: &Path
         }
     }
 
-    let child = command.spawn()?;
-    fs::write(pid_path, format!("{}\n", child.id()))?;
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let deadline = Instant::now() + DAEMON_STARTUP_TIMEOUT;
+    loop {
+        if let Some(exit) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "Daemon PID {pid} exited during startup: {exit}"
+            ))
+            .into());
+        }
+        let status = read_daemon_status(status_path, pid)?;
+        if status.is_some() || Instant::now() >= deadline {
+            ensure_forwarding_ready(pid, status.as_deref())?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     if config.daemon_log {
         println!(
             "Daemon started with PID {}. Log file: {}",
@@ -128,21 +163,42 @@ fn daemon_stdio(log_enabled: bool, log_path: &Path) -> AppResult<(Stdio, Stdio)>
         let stderr = stdout.try_clone()?;
         Ok((Stdio::from(stdout), Stdio::from(stderr)))
     } else {
-        let stdout = File::open(null_device_path())?;
-        let stderr = stdout.try_clone()?;
-        Ok((Stdio::from(stdout), Stdio::from(stderr)))
+        Ok((Stdio::null(), Stdio::null()))
     }
 }
 
-fn null_device_path() -> &'static str {
-    #[cfg(windows)]
-    {
-        "NUL"
-    }
+fn write_daemon_status(path: &Path, pid: ProcessId, error: Option<&str>) -> AppResult<()> {
+    let temporary = path.with_extension(format!("status.{pid}.tmp"));
+    fs::write(&temporary, format!("{pid}\n{}", error.unwrap_or_default()))?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
 
-    #[cfg(not(windows))]
+fn read_daemon_status(path: &Path, pid: ProcessId) -> AppResult<Option<String>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if let Some((owner, error)) = content.split_once('\n')
+        && owner.parse::<ProcessId>() == Ok(pid)
     {
-        "/dev/null"
+        return Ok(Some(error.to_owned()));
+    }
+    Ok(None)
+}
+
+fn ensure_forwarding_ready(pid: ProcessId, status: Option<&str>) -> AppResult<()> {
+    match status {
+        Some("") => Ok(()),
+        Some(error) => Err(io::Error::other(format!(
+            "Daemon PID {pid} could not apply the config and will retry: {error}"
+        ))
+        .into()),
+        None => Err(io::Error::other(format!(
+            "Daemon PID {pid} has not reported forwarding readiness. Check vorto status."
+        ))
+        .into()),
     }
 }
 
@@ -163,14 +219,18 @@ fn stop_daemon(pid_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn print_status(pid_path: &Path) -> AppResult<()> {
+fn print_status(pid_path: &Path, status_path: &Path) -> AppResult<()> {
     let Some(pid) = read_pid(pid_path)? else {
         println!("Daemon is not running.");
         return Ok(());
     };
 
     if daemon_process_matches(pid)? {
-        println!("Daemon is running with PID {}.", pid);
+        match read_daemon_status(status_path, pid)?.as_deref() {
+            Some("") => println!("Daemon is running with PID {pid}. Forwarding config is applied."),
+            Some(error) => println!("Daemon PID {pid} is retrying the forwarding config: {error}"),
+            None => println!("Daemon PID {pid} has not reported forwarding readiness."),
+        }
     } else {
         println!("The PID file does not point to a running daemon for this executable.");
     }
@@ -184,19 +244,17 @@ fn print_help() {
     println!("  ./vorto run      Run in the foreground (./config.yaml)");
     println!("  ./vorto daemon   Run in the background (hot-reload ./config.yaml changes)");
     println!("  ./vorto stop     Stop the background process");
-    println!("  ./vorto status   Show background process status");
+    println!("  ./vorto status   Show background process and forwarding status");
     println!("  ./vorto version  Show release, commit, and repository information");
     println!("  ./vorto help     Show this help message");
 }
 
 fn read_pid(path: &Path) -> AppResult<Option<ProcessId>> {
-    if !path.exists() {
-        return Ok(None);
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(parse_pid(&content)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-
-    let content = fs::read_to_string(path)?;
-    let pid = parse_pid(&content)?;
-    Ok(Some(pid))
 }
 
 #[cfg(target_os = "linux")]
@@ -273,20 +331,30 @@ fn platform_pid(pid: ProcessId) -> AppResult<libc::pid_t> {
 
 struct PidFileGuard {
     path: PathBuf,
+    pid: ProcessId,
 }
 
 impl PidFileGuard {
     fn new(path: &Path) -> AppResult<Self> {
-        fs::write(path, format!("{}\n", std::process::id()))?;
+        let pid = std::process::id();
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        if let Err(error) = writeln!(file, "{pid}") {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error.into());
+        }
         Ok(Self {
             path: path.to_path_buf(),
+            pid,
         })
     }
 }
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if read_pid(&self.path).ok().flatten() == Some(self.pid) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 

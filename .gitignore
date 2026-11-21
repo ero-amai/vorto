@@ -1,3 +1,5 @@
 /target
 vorto
 config.yaml
+/vorto.status
+/vorto.status.*.tmp
